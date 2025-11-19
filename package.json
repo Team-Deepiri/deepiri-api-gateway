@@ -2,10 +2,11 @@
   "name": "deepiri-api-gateway",
   "version": "1.0.0",
   "description": "API Gateway - Request Routing and Authentication",
-  "main": "src/index.js",
+  "main": "dist/server.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "test": "jest"
   },
   "dependencies": {
@@ -20,8 +21,14 @@
     "winston": "^3.11.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "@types/winston": "^2.4.4",
     "jest": "^25.0.0",
     "nodemon": "^3.1.9",
-    "supertest": "^6.3.3"
+    "supertest": "^6.3.3",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
   }
 }
