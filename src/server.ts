@@ -1,5 +1,6 @@
 import express, { Express, Request, Response, ErrorRequestHandler } from 'express';
 import { createProxyMiddleware, Options } from 'http-proxy-middleware';
+import { createServer, Server as HttpServer } from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
@@ -8,6 +9,7 @@ import winston from 'winston';
 dotenv.config();
 
 const app: Express = express();
+const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
 
 const logger = winston.createLogger({
@@ -26,6 +28,7 @@ interface ServiceUrls {
   challenge: string;
   realtime: string;
   cyrex: string;
+  adventureOrchestrator: string;
 }
 
 // Service URLs
@@ -38,7 +41,9 @@ const SERVICES: ServiceUrls = {
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
   challenge: process.env.CHALLENGE_SERVICE_URL || 'http://challenge-service:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
-  cyrex: process.env.CYREX_URL || 'http://cyrex:8000'
+  cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
+  // Adventure Orchestrator - handles adventure generation, management, and user adventures
+  adventureOrchestrator: process.env.ADVENTURE_ORCHESTRATOR_URL || process.env.ENGAGEMENT_SERVICE_URL || 'http://engagement-service:5003'
 };
 
 app.use(helmet({
@@ -216,6 +221,12 @@ app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integrat
 app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
 
+// Adventure Orchestrator - handles adventure generation, management, and user adventures
+// Routes /api/adventures/* to the adventure orchestrator service
+// Express strips /api/adventures, so /api/adventures?limit=20 becomes /?limit=20
+// Path rewrite: / -> /api/adventures to restore the full path
+app.use('/api/adventures', createProxyMiddleware(createProxy(SERVICES.adventureOrchestrator, { '^/': '/api/adventures' })));
+
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
   logger.error('Proxy error:', { 
@@ -253,9 +264,32 @@ process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-app.listen(PORT, () => {
+// WebSocket proxy for Socket.IO - route to realtime gateway
+// Socket.IO uses /socket.io path for WebSocket connections
+const socketIoProxy = createProxyMiddleware('/socket.io', {
+  target: SERVICES.realtime,
+  changeOrigin: true,
+  ws: true, // Enable WebSocket proxying
+  logLevel: 'info'
+});
+
+// Apply Socket.IO proxy middleware
+app.use(socketIoProxy);
+
+// Handle WebSocket upgrade requests
+httpServer.on('upgrade', (req, socket, head) => {
+  if (req.url?.startsWith('/socket.io')) {
+    logger.info(`WebSocket upgrade request: ${req.url}`);
+    socketIoProxy.upgrade(req, socket, head);
+  } else {
+    socket.destroy();
+  }
+});
+
+httpServer.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
   logger.info('Proxying to services:', SERVICES);
+  logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
 }).on('error', (error: any) => {
   logger.error('Server error:', error);
   if (error.code === 'EADDRINUSE') {
