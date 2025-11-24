@@ -28,7 +28,6 @@ interface ServiceUrls {
   challenge: string;
   realtime: string;
   cyrex: string;
-  adventureOrchestrator: string;
 }
 
 // Service URLs
@@ -41,9 +40,7 @@ const SERVICES: ServiceUrls = {
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
   challenge: process.env.CHALLENGE_SERVICE_URL || 'http://challenge-service:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
-  cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
-  // Adventure Orchestrator - handles adventure generation, management, and user adventures
-  adventureOrchestrator: process.env.ADVENTURE_ORCHESTRATOR_URL || process.env.ENGAGEMENT_SERVICE_URL || 'http://engagement-service:5003'
+  cyrex: process.env.CYREX_URL || 'http://cyrex:8000'
 };
 
 app.use(helmet({
@@ -220,12 +217,6 @@ app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.notific
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
-
-// Adventure Orchestrator - handles adventure generation, management, and user adventures
-// Routes /api/adventures/* to the adventure orchestrator service
-// Express strips /api/adventures, so /api/adventures?limit=20 becomes /?limit=20
-// Path rewrite: / -> /api/adventures to restore the full path
-app.use('/api/adventures', createProxyMiddleware(createProxy(SERVICES.adventureOrchestrator, { '^/': '/api/adventures' })));
 
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
