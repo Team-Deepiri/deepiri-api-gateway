@@ -30,7 +30,7 @@ interface ServiceUrls {
   cyrex: string;
 }
 
-// Service URLs
+// Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
   task: process.env.TASK_ORCHESTRATOR_URL || 'http://task-orchestrator:5002',
@@ -42,6 +42,81 @@ const SERVICES: ServiceUrls = {
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000'
 };
+
+// Validate all service URLs are defined
+const validateServiceUrls = () => {
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex'];
+  const missingServices: string[] = [];
+  
+  // Log environment variables for debugging
+  logger.info('Environment variables check:', {
+    AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
+    TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
+    ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
+    PLATFORM_ANALYTICS_SERVICE_URL: process.env.PLATFORM_ANALYTICS_SERVICE_URL,
+    NOTIFICATION_SERVICE_URL: process.env.NOTIFICATION_SERVICE_URL,
+    EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
+    CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
+    REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
+    CYREX_URL: process.env.CYREX_URL
+  });
+  
+  for (const service of requiredServices) {
+    const serviceUrl = SERVICES[service];
+    if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
+      missingServices.push(service);
+      logger.error(`Service URL missing for ${service}:`, { 
+        envVar: getEnvVarName(service),
+        value: process.env[getEnvVarName(service)],
+        default: getDefaultUrl(service),
+        resolved: serviceUrl 
+      });
+    }
+  }
+  
+  if (missingServices.length > 0) {
+    logger.error('Missing or empty service URLs:', missingServices);
+    logger.error('Current SERVICES configuration:', SERVICES);
+    throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
+  }
+  
+  logger.info('All service URLs validated successfully:', SERVICES);
+};
+
+// Helper to get environment variable name
+const getEnvVarName = (service: keyof ServiceUrls): string => {
+  const envMap: Record<keyof ServiceUrls, string> = {
+    auth: 'AUTH_SERVICE_URL',
+    task: 'TASK_ORCHESTRATOR_URL',
+    engagement: 'ENGAGEMENT_SERVICE_URL',
+    analytics: 'PLATFORM_ANALYTICS_SERVICE_URL',
+    notification: 'NOTIFICATION_SERVICE_URL',
+    integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
+    challenge: 'CHALLENGE_SERVICE_URL',
+    realtime: 'REALTIME_GATEWAY_URL',
+    cyrex: 'CYREX_URL'
+  };
+  return envMap[service];
+};
+
+// Helper to get default URL
+const getDefaultUrl = (service: keyof ServiceUrls): string => {
+  const defaults: Record<keyof ServiceUrls, string> = {
+    auth: 'http://auth-service:5001',
+    task: 'http://task-orchestrator:5002',
+    engagement: 'http://engagement-service:5003',
+    analytics: 'http://platform-analytics-service:5004',
+    notification: 'http://notification-service:5005',
+    integration: 'http://external-bridge-service:5006',
+    challenge: 'http://challenge-service:5007',
+    realtime: 'http://realtime-gateway:5008',
+    cyrex: 'http://cyrex:8000'
+  };
+  return defaults[service];
+};
+
+// Validate on startup
+validateServiceUrls();
 
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
@@ -257,25 +332,70 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
 // Socket.IO uses /socket.io path for WebSocket connections
-const socketIoProxy = createProxyMiddleware('/socket.io', {
-  target: SERVICES.realtime,
-  changeOrigin: true,
-  ws: true, // Enable WebSocket proxying
-  logLevel: 'info'
+// Only create proxy if realtime service URL is defined and valid
+let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
+
+const realtimeUrl = SERVICES.realtime;
+logger.info('Checking realtime service URL:', { 
+  url: realtimeUrl, 
+  type: typeof realtimeUrl,
+  isEmpty: realtimeUrl === '',
+  isUndefined: realtimeUrl === undefined,
+  isNull: realtimeUrl === null,
+  trimmed: typeof realtimeUrl === 'string' ? realtimeUrl.trim() : 'N/A'
 });
 
-// Apply Socket.IO proxy middleware
-app.use(socketIoProxy);
-
-// Handle WebSocket upgrade requests
-httpServer.on('upgrade', (req, socket, head) => {
-  if (req.url?.startsWith('/socket.io')) {
-    logger.info(`WebSocket upgrade request: ${req.url}`);
-    socketIoProxy.upgrade(req, socket, head);
-  } else {
-    socket.destroy();
+if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
+  try {
+    logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    socketIoProxy = createProxyMiddleware('/socket.io', {
+      target: realtimeUrl.trim(),
+      changeOrigin: true,
+      ws: true, // Enable WebSocket proxying
+      logLevel: 'info',
+      onError: (err: Error, req: express.Request, res: express.Response) => {
+        logger.error('Socket.IO proxy error:', err.message);
+        if (!res.headersSent) {
+          res.status(503).json({ error: 'Realtime service unavailable' });
+        }
+      }
+    });
+    logger.info('Socket.IO proxy initialized successfully');
+  } catch (error: any) {
+    logger.error('Failed to create Socket.IO proxy:', error.message);
+    socketIoProxy = null;
   }
-});
+} else {
+  logger.warn('REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
+    realtimeUrl,
+    envVar: process.env.REALTIME_GATEWAY_URL
+  });
+}
+
+// Apply Socket.IO proxy middleware (only if configured)
+if (socketIoProxy) {
+  app.use(socketIoProxy);
+  
+  // Handle WebSocket upgrade requests
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url?.startsWith('/socket.io')) {
+      logger.info(`WebSocket upgrade request: ${req.url}`);
+      socketIoProxy!.upgrade(req, socket, head);
+    } else {
+      socket.destroy();
+    }
+  });
+} else {
+  // If Socket.IO proxy is not configured, handle WebSocket requests gracefully
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url?.startsWith('/socket.io')) {
+      logger.warn('WebSocket upgrade requested but realtime service not configured');
+      socket.destroy();
+    } else {
+      socket.destroy();
+    }
+  });
+}
 
 httpServer.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
