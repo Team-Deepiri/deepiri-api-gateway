@@ -1,6 +1,7 @@
 import express, { Express, Request, Response, ErrorRequestHandler } from 'express';
 import { createProxyMiddleware, Options } from 'http-proxy-middleware';
 import { createServer, Server as HttpServer } from 'http';
+import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
@@ -186,7 +187,7 @@ app.use((req, res, next) => {
 // Proxy routes with proper body restreaming
 // http-proxy-middleware handles body streaming automatically, but we need to
 // restream if express.json() has already consumed the stream
-const createProxy = (target: string, pathRewrite?: { [key: string]: string }): Options => ({
+const createProxy = (target: string, pathRewrite?: { [key: string]: string }): any => ({
   target,
   changeOrigin: true,
   pathRewrite,
@@ -238,7 +239,7 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): O
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
 // Auth routes with enhanced logging
-const authProxyOptions = createProxy(SERVICES.auth, { '^/': '/auth/' });
+const authProxyOptions: any = createProxy(SERVICES.auth, { '^/': '/auth/' });
 // Override onProxyReq to add detailed logging
 const originalAuthOnProxyReq = authProxyOptions.onProxyReq;
 const originalAuthOnProxyRes = authProxyOptions.onProxyRes;
@@ -348,18 +349,19 @@ logger.info('Checking realtime service URL:', {
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
     logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
-    socketIoProxy = createProxyMiddleware('/socket.io', {
+    socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
+      pathFilter: (path: string) => path.startsWith('/socket.io'),
       onError: (err: Error, req: express.Request, res: express.Response) => {
         logger.error('Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
-    });
+    } as any);
     logger.info('Socket.IO proxy initialized successfully');
   } catch (error: any) {
     logger.error('Failed to create Socket.IO proxy:', error.message);
@@ -377,10 +379,10 @@ if (socketIoProxy) {
   app.use(socketIoProxy);
   
   // Handle WebSocket upgrade requests
-  httpServer.on('upgrade', (req, socket, head) => {
+  httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
       logger.info(`WebSocket upgrade request: ${req.url}`);
-      socketIoProxy!.upgrade(req, socket, head);
+      (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
     }
