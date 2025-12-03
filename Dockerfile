@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN apk add --no-cache curl dumb-init
 
-COPY backend/deepiri-api-gateway/package*.json ./
+COPY backend/deepiri-api-gateway/package.json ./
 RUN npm install --legacy-peer-deps && npm cache clean --force
 
 COPY backend/deepiri-api-gateway/tsconfig.json ./
