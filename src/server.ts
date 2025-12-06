@@ -195,7 +195,7 @@ app.use((req, res, next) => {
 // Proxy routes with proper body restreaming
 // http-proxy-middleware handles body streaming automatically, but we need to
 // restream if express.json() has already consumed the stream
-const createProxy = (target: string, pathRewrite?: { [key: string]: string }): ExtendedProxyOptions => ({
+const createProxy = (target: string, pathRewrite?: { [key: string]: string }): any => ({
   target,
   changeOrigin: true,
   pathRewrite,
@@ -247,7 +247,7 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): E
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
 // Auth routes with enhanced logging
-const authProxyOptions = createProxy(SERVICES.auth, { '^/': '/auth/' });
+const authProxyOptions: any = createProxy(SERVICES.auth, { '^/': '/auth/' });
 // Override onProxyReq to add detailed logging
 const originalAuthOnProxyReq = authProxyOptions.onProxyReq;
 const originalAuthOnProxyRes = authProxyOptions.onProxyRes;
@@ -357,27 +357,19 @@ logger.info('Checking realtime service URL:', {
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
     logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
-    // Use filter function - http-proxy-middleware v3 API
-    // Type assertion needed because TypeScript types don't fully match runtime API
-    const socketIoOptions: ExtendedProxyOptions = {
+    socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
+      pathFilter: (path: string) => path.startsWith('/socket.io'),
       onError: (err: Error, req: express.Request, res: express.Response) => {
         logger.error('Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
-    };
-    // Use type assertion to bypass TypeScript's strict checking for filter function
-    socketIoProxy = (createProxyMiddleware as any)(
-      (pathname: string | undefined, req: express.Request): boolean => {
-        return pathname?.startsWith('/socket.io') || false;
-      },
-      socketIoOptions
-    );
+    } as any);
     logger.info('Socket.IO proxy initialized successfully');
   } catch (error: any) {
     logger.error('Failed to create Socket.IO proxy:', error.message);
@@ -398,9 +390,7 @@ if (socketIoProxy) {
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
       logger.info(`WebSocket upgrade request: ${req.url}`);
-      // Type assertion needed because http-proxy-middleware expects Socket but we have Duplex
-      // The upgrade method signature expects (req, socket, head) where socket is Socket
-      (socketIoProxy as any).upgrade(req, socket, head);
+      (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
     }
