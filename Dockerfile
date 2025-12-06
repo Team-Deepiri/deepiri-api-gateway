@@ -4,16 +4,8 @@ WORKDIR /app
 
 RUN apk add --no-cache curl dumb-init
 
-COPY backend/deepiri-api-gateway/package*.json ./
-# Add retry logic for network issues
-RUN npm config set fetch-retries 5 && \
-    npm config set fetch-retry-mintimeout 20000 && \
-    npm config set fetch-retry-maxtimeout 120000 && \
-    npm config set fetch-timeout 300000 && \
-    npm install --legacy-peer-deps || \
-    (sleep 10 && npm install --legacy-peer-deps) || \
-    (sleep 20 && npm install --legacy-peer-deps) && \
-    npm cache clean --force
+COPY backend/deepiri-api-gateway/package.json ./
+RUN npm install --legacy-peer-deps && npm cache clean --force
 
 COPY backend/deepiri-api-gateway/tsconfig.json ./
 COPY backend/deepiri-api-gateway/src ./src
