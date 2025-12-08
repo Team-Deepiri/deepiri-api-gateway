@@ -6,6 +6,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
+import httpProxy from 'http-proxy';
 
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
@@ -56,7 +57,7 @@ const SERVICES: ServiceUrls = {
 const validateServiceUrls = () => {
   const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex'];
   const missingServices: string[] = [];
-  
+
   // Log environment variables for debugging
   logger.info('Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
@@ -69,26 +70,26 @@ const validateServiceUrls = () => {
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
     CYREX_URL: process.env.CYREX_URL
   });
-  
+
   for (const service of requiredServices) {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      logger.error(`Service URL missing for ${service}:`, { 
+      logger.error(`Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
-        resolved: serviceUrl 
+        resolved: serviceUrl
       });
     }
   }
-  
+
   if (missingServices.length > 0) {
     logger.error('Missing or empty service URLs:', missingServices);
     logger.error('Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
-  
+
   logger.info('All service URLs validated successfully:', SERVICES);
 };
 
@@ -141,22 +142,22 @@ app.use(cors({
 
 // Health check needs to come BEFORE proxy routes
 app.get('/health', (req: Request, res: Response) => {
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     service: 'api-gateway',
     services: Object.keys(SERVICES),
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString()
   });
 });
 
 // Test endpoint to verify the gateway is working
 app.post('/test', (req: Request, res: Response) => {
   logger.info('Test endpoint called', { body: req.body, headers: req.headers });
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     message: 'API Gateway is working',
     receivedBody: req.body,
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -227,12 +228,12 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
     logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    logger.error('Proxy error:', { 
-      error: err.message, 
-      target, 
+    logger.error('Proxy error:', {
+      error: err.message,
+      target,
       path: req.originalUrl || req.path,
       method: req.method,
-      stack: err.stack 
+      stack: err.stack
     });
     if (!res.headersSent) {
       res.status(503).json({ error: 'Service unavailable', message: err.message });
@@ -279,14 +280,14 @@ authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
       'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
     }
   });
-  
+
   // Ensure CORS headers are properly set from the auth service response
   // Don't overwrite them - let the auth service's CORS middleware handle it
   // But log if they're missing
   if (!proxyRes.headers['access-control-allow-origin']) {
     logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
   }
-  
+
   // Call original handler if it exists
   if (originalAuthOnProxyRes) {
     originalAuthOnProxyRes(proxyRes, req, res);
@@ -304,14 +305,14 @@ app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': 
 
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  logger.error('Proxy error:', { 
-    error: err.message, 
+  logger.error('Proxy error:', {
+    error: err.message,
     stack: err.stack,
     path: req.path,
-    method: req.method 
+    method: req.method
   });
   if (!res.headersSent) {
-    res.status(503).json({ 
+    res.status(503).json({
       error: 'Service unavailable',
       message: err.message,
       path: req.path
@@ -322,7 +323,7 @@ app.use((err: Error, req: Request, res: Response, next: Function) => {
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
   logger.warn(`Unhandled route: ${req.method} ${req.path}`);
-  res.status(404).json({ 
+  res.status(404).json({
     error: 'Not found',
     path: req.path,
     method: req.method
@@ -341,12 +342,11 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
 // Socket.IO uses /socket.io path for WebSocket connections
-// Only create proxy if realtime service URL is defined and valid
-let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
+let socketIoProxy: any | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-logger.info('Checking realtime service URL:', { 
-  url: realtimeUrl, 
+logger.info('Checking realtime service URL:', {
+  url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
   isUndefined: realtimeUrl === undefined,
@@ -356,21 +356,25 @@ logger.info('Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
-    socketIoProxy = createProxyMiddleware({
+    logger.info(`Initializing Socket.IO WebSocket proxy to: ${realtimeUrl}`);
+    socketIoProxy = httpProxy.createProxyServer({
       target: realtimeUrl.trim(),
       changeOrigin: true,
-      ws: true, // Enable WebSocket proxying
-      logLevel: 'info',
-      pathFilter: (path: string) => path.startsWith('/socket.io'),
-      onError: (err: Error, req: express.Request, res: express.Response) => {
-        logger.error('Socket.IO proxy error:', err.message);
-        if (!res.headersSent) {
-          res.status(503).json({ error: 'Realtime service unavailable' });
-        }
-      }
+      ws: true
     } as any);
-    logger.info('Socket.IO proxy initialized successfully');
+
+    socketIoProxy.on('error', (err: any) => {
+      logger.error('Socket.IO proxy error:', {
+        message: err.message,
+        code: err.code,
+        errno: err.errno,
+        syscall: err.syscall,
+        hostname: err.hostname,
+        port: err.port
+      });
+    });
+
+    logger.info('Socket.IO WebSocket proxy initialized successfully');
   } catch (error: any) {
     logger.error('Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
@@ -382,15 +386,12 @@ if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '')
   });
 }
 
-// Apply Socket.IO proxy middleware (only if configured)
+// Handle WebSocket upgrade requests for Socket.IO
 if (socketIoProxy) {
-  app.use(socketIoProxy);
-  
-  // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.info(`WebSocket upgrade request: ${req.url}`);
-      (socketIoProxy as any).upgrade(req, socket as any, head);
+      logger.debug(`WebSocket upgrade request: ${req.url}`);
+      socketIoProxy!.ws(req, socket, head);
     } else {
       socket.destroy();
     }
