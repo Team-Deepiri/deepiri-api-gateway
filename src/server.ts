@@ -7,6 +7,14 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
 
+// Extend Options type to include callback properties that exist at runtime
+interface ExtendedProxyOptions extends Options {
+  onProxyReq?: (proxyReq: any, req: any, res: any) => void;
+  onProxyRes?: (proxyRes: any, req: any, res: any) => void;
+  onError?: (err: Error, req: express.Request, res: express.Response) => void;
+  logLevel?: 'debug' | 'info' | 'warn' | 'error' | 'silent';
+}
+
 dotenv.config();
 
 const app: Express = express();
