@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "API Gateway - Request Routing and Authentication",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",

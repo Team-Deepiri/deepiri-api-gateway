@@ -1,6 +1,7 @@
 import express, { Express, Request, Response, ErrorRequestHandler } from 'express';
 import { createProxyMiddleware, Options } from 'http-proxy-middleware';
 import { createServer, Server as HttpServer } from 'http';
+import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
@@ -120,38 +121,40 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): O
   selfHandleResponse: false, // Let proxy handle response automatically
   // Preserve CORS headers from the backend service
   // Don't overwrite them - let the backend service handle CORS
-  onProxyReq: (proxyReq: any, req: any, res: any) => {
-    try {
-      // Since we skip body parsing for /api/* routes, the request stream is intact
-      // http-proxy-middleware will automatically pipe the request stream
-      // Log the request for debugging
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        const contentType = req.get('content-type') || 'unknown';
-        const contentLength = req.get('content-length') || 'unknown';
-        logger.info(`Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
-          contentType,
-          contentLength,
-          hasBody: !!req.body
-        });
+  on: {
+    proxyReq: (proxyReq: any, req: any, res: any) => {
+      try {
+        // Since we skip body parsing for /api/* routes, the request stream is intact
+        // http-proxy-middleware will automatically pipe the request stream
+        // Log the request for debugging
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          const contentType = req.get('content-type') || 'unknown';
+          const contentLength = req.get('content-length') || 'unknown';
+          logger.info(`Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
+            contentType,
+            contentLength,
+            hasBody: !!req.body
+          });
+        }
+      } catch (error) {
+        logger.error('Error in onProxyReq:', error);
       }
-    } catch (error) {
-      logger.error('Error in onProxyReq:', error);
-    }
-  },
-  onProxyRes: (proxyRes: any, req: any, res: any) => {
-    // Log response but don't modify CORS headers - let backend service handle them
-    logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
-  },
-  onError: (err: any, req: any, res: any) => {
-    logger.error('Proxy error:', { 
-      error: err.message, 
-      target, 
-      path: req.originalUrl || req.path,
-      method: req.method,
-      stack: err.stack 
-    });
-    if (!res.headersSent) {
-      res.status(503).json({ error: 'Service unavailable', message: err.message });
+    },
+    proxyRes: (proxyRes: any, req: any, res: any) => {
+      // Log response but don't modify CORS headers - let backend service handle them
+      logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
+    },
+    error: (err: any, req: any, res: any) => {
+      logger.error('Proxy error:', { 
+        error: err.message, 
+        target, 
+        path: req.originalUrl || req.path,
+        method: req.method,
+        stack: err.stack 
+      });
+      if (!res.headersSent) {
+        res.status(503).json({ error: 'Service unavailable', message: err.message });
+      }
     }
   }
 });
@@ -163,49 +166,71 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): O
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
 // Auth routes with enhanced logging
-const authProxyOptions = createProxy(SERVICES.auth, { '^/': '/auth/' });
-// Override onProxyReq to add detailed logging
-const originalAuthOnProxyReq = authProxyOptions.onProxyReq;
-const originalAuthOnProxyRes = authProxyOptions.onProxyRes;
-authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
-  const rewrittenPath = req.path.replace(/^\//, '/auth/');
-  const contentType = req.get('content-type') || 'unknown';
-  const contentLength = req.get('content-length') || 'unknown';
-  logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
-    contentType,
-    contentLength,
-    headers: {
-      'content-type': req.get('content-type'),
-      'content-length': req.get('content-length'),
-      'authorization': req.get('authorization') ? 'present' : 'missing'
-    }
-  });
-  // Call original handler if it exists
-  if (originalAuthOnProxyReq) {
-    originalAuthOnProxyReq(proxyReq, req, res);
-  }
-};
-authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
-  // Log the response
-  logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
-    statusCode: proxyRes.statusCode,
-    headers: {
-      'content-type': proxyRes.headers['content-type'],
-      'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
-      'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
-    }
-  });
-  
-  // Ensure CORS headers are properly set from the auth service response
-  // Don't overwrite them - let the auth service's CORS middleware handle it
-  // But log if they're missing
-  if (!proxyRes.headers['access-control-allow-origin']) {
-    logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
-  }
-  
-  // Call original handler if it exists
-  if (originalAuthOnProxyRes) {
-    originalAuthOnProxyRes(proxyRes, req, res);
+const baseAuthProxyOptions = createProxy(SERVICES.auth, { '^/': '/auth/' });
+// Override onProxyReq and onProxyRes to add detailed logging
+const originalAuthOnProxyReq = baseAuthProxyOptions.on?.proxyReq;
+const originalAuthOnProxyRes = baseAuthProxyOptions.on?.proxyRes;
+const originalAuthOnError = baseAuthProxyOptions.on?.error;
+const authProxyOptions: Options = {
+  ...baseAuthProxyOptions,
+  on: {
+    proxyReq: (proxyReq: any, req: any, res: any) => {
+      const rewrittenPath = req.path.replace(/^\//, '/auth/');
+      const contentType = req.get('content-type') || 'unknown';
+      const contentLength = req.get('content-length') || 'unknown';
+      logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+        contentType,
+        contentLength,
+        headers: {
+          'content-type': req.get('content-type'),
+          'content-length': req.get('content-length'),
+          'authorization': req.get('authorization') ? 'present' : 'missing'
+        }
+      });
+      // Call original handler if it exists
+      if (originalAuthOnProxyReq) {
+        // In v3, handlers may have 4 parameters, but we only have 3
+        // Call with the parameters we have - TypeScript will handle the optional 4th param
+        (originalAuthOnProxyReq as any)(proxyReq, req, res);
+      }
+    },
+    proxyRes: (proxyRes: any, req: any, res: any) => {
+      // Log the response
+      logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+        statusCode: proxyRes.statusCode,
+        headers: {
+          'content-type': proxyRes.headers['content-type'],
+          'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
+          'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
+        }
+      });
+      
+      // Ensure CORS headers are properly set from the auth service response
+      // Don't overwrite them - let the auth service's CORS middleware handle it
+      // But log if they're missing
+      if (!proxyRes.headers['access-control-allow-origin']) {
+        logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
+      }
+      
+      // Call original handler if it exists
+      if (originalAuthOnProxyRes) {
+        // In v3, handlers may have 4 parameters, but we only have 3
+        // Call with the parameters we have - TypeScript will handle the optional 4th param
+        (originalAuthOnProxyRes as any)(proxyRes, req, res);
+      }
+    },
+    error: originalAuthOnError || ((err: any, req: any, res: any) => {
+      logger.error('Proxy error:', { 
+        error: err.message, 
+        target: SERVICES.auth, 
+        path: req.originalUrl || req.path,
+        method: req.method,
+        stack: err.stack 
+      });
+      if (!res.headersSent) {
+        res.status(503).json({ error: 'Service unavailable', message: err.message });
+      }
+    })
   }
 };
 app.use('/api/auth', createProxyMiddleware(authProxyOptions));
@@ -257,18 +282,18 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
 // Socket.IO uses /socket.io path for WebSocket connections
-const socketIoProxy = createProxyMiddleware('/socket.io', {
+const socketIoProxy = createProxyMiddleware({
   target: SERVICES.realtime,
   changeOrigin: true,
   ws: true, // Enable WebSocket proxying
-  logLevel: 'info'
+  pathFilter: (pathname, req) => pathname.startsWith('/socket.io')
 });
 
 // Apply Socket.IO proxy middleware
 app.use(socketIoProxy);
 
 // Handle WebSocket upgrade requests
-httpServer.on('upgrade', (req, socket, head) => {
+httpServer.on('upgrade', (req: any, socket: Socket, head: Buffer) => {
   if (req.url?.startsWith('/socket.io')) {
     logger.info(`WebSocket upgrade request: ${req.url}`);
     socketIoProxy.upgrade(req, socket, head);
