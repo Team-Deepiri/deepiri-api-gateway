@@ -6,7 +6,6 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
-import httpProxy from 'http-proxy';
 
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
@@ -342,7 +341,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
 // Socket.IO uses /socket.io path for WebSocket connections
-let socketIoProxy: any | null = null;
+// Only create proxy if realtime service URL is defined and valid
+let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
 logger.info('Checking realtime service URL:', {
@@ -356,25 +356,23 @@ logger.info('Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    logger.info(`Initializing Socket.IO WebSocket proxy to: ${realtimeUrl}`);
-    socketIoProxy = httpProxy.createProxyServer({
+    logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
-      ws: true
+      ws: true, // Enable WebSocket proxying
+      logLevel: 'info',
+      onProxyReqWs: (_proxyReq: any, req: any) => {
+        logger.info(`Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+      },
+      onError: (err: Error, req: express.Request, res: express.Response) => {
+        logger.error('Socket.IO proxy error:', err.message);
+        if (!res.headersSent) {
+          res.status(503).json({ error: 'Realtime service unavailable' });
+        }
+      }
     } as any);
-
-    socketIoProxy.on('error', (err: any) => {
-      logger.error('Socket.IO proxy error:', {
-        message: err.message,
-        code: err.code,
-        errno: err.errno,
-        syscall: err.syscall,
-        hostname: err.hostname,
-        port: err.port
-      });
-    });
-
-    logger.info('Socket.IO WebSocket proxy initialized successfully');
+    logger.info('Socket.IO proxy initialized successfully');
   } catch (error: any) {
     logger.error('Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
@@ -386,12 +384,15 @@ if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '')
   });
 }
 
-// Handle WebSocket upgrade requests for Socket.IO
+// Apply Socket.IO proxy middleware (only if configured)
 if (socketIoProxy) {
+  app.use(socketIoProxy);
+
+  // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.debug(`WebSocket upgrade request: ${req.url}`);
-      socketIoProxy!.ws(req, socket, head);
+      logger.info(`WebSocket upgrade request: ${req.url}`);
+      (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
     }
