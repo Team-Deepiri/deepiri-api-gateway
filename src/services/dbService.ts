@@ -9,7 +9,7 @@
  * - Pool statistics and health monitoring
  */
 
-import { Pool, PoolConfig, QueryResult } from 'pg';
+import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 import winston from 'winston';
 
 const logger = winston.createLogger({
@@ -120,7 +120,7 @@ export async function initDb(): Promise<void> {
 /**
  * Execute a database query with timing and statistics
  */
-export async function query<T = any>(
+export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string, 
   params?: any[]
 ): Promise<{ result: QueryResult<T>; timeNs: bigint; timeMs: number }> {
@@ -171,7 +171,7 @@ export async function query<T = any>(
  * Execute a query with Redis cache integration
  * First checks cache, then falls back to database
  */
-export async function queryWithCache<T = any>(
+export async function queryWithCache<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: any[] | undefined,
   cacheKey: string,
