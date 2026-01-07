@@ -353,18 +353,29 @@ const throttlingMiddleware = (req: Request, res: Response, next: Function) => {
   const bucket = match?.bucket ?? globalTokenBucket;
   const bucketName = match?.name ?? "global";
 
+  // Set rate limit headers
+  res.set('RateLimit-Limit', bucket.getCapacity().toString());
+  res.set('RateLimit-Remaining', Math.floor(bucket.getTokens()).toString());
+  res.set('RateLimit-Reset', Math.floor((Date.now() + 1000) / 1000).toString()); // Approximate next second
+
   if (bucket.consume(1)) {
-    logger.info(`[THROTTLE] Request allowed - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Tokens left: ${bucket.getTokens()}`);
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.info(`[THROTTLE] Request allowed - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Tokens left: ${bucket.getTokens()}`);
+    }
     return next();
   }
 
   const queued = requestQueue.enqueue(req, res, next, bucket, bucketName);
   if (queued) {
-    logger.warn(`[THROTTLE] Request queued - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Queue length: ${requestQueue.getQueueLength()}`);
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.warn(`[THROTTLE] Request queued - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Queue length: ${requestQueue.getQueueLength()}`);
+    }
     return;
   }
 
-  logger.error(`[THROTTLE] Request rejected - Queue full, IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}`);
+  if (process.env.RATE_LIMIT_DEBUG === '1') {
+    logger.error(`[THROTTLE] Request rejected - Queue full, IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}`);
+  }
   res.status(429).json({
     error: "Service temporarily overloaded",
     message: "Too many concurrent requests. Please try again later.",
@@ -399,6 +410,17 @@ app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
   return generalLimiter(req, res, next);
 });
+
+// Test endpoint for rate limiting validation (only enabled in non-prod or with flag)
+if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== 'production') {
+  app.get('/api/rl-test', (req: Request, res: Response) => {
+    res.json({ 
+      ok: true, 
+      ts: new Date().toISOString(), 
+      ip: req.ip 
+    });
+  });
+}
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({
