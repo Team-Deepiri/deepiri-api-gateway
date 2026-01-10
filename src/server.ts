@@ -7,6 +7,12 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
 
+// Import our new services for connection pooling
+import * as redisService from './services/redisService';
+import * as dbService from './services/dbService';
+import { Timer, calculateStats, formatDuration } from './utils/timing';
+import { cacheMiddleware } from './middleware/cacheMiddleware';
+
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
   onProxyReq?: (proxyReq: any, req: any, res: any) => void;
@@ -139,12 +145,41 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
+// Initialize Redis and DB connection pools
+async function initializeServices() {
+  try {
+    logger.info('Initializing Redis connection pool...');
+    await redisService.initRedis();
+    logger.info('Redis connection pool ready');
+  } catch (error: any) {
+    logger.warn('Redis initialization failed (will retry on first use):', error.message);
+  }
+
+  try {
+    logger.info('Initializing PostgreSQL connection pool...');
+    await dbService.initDb();
+    logger.info('PostgreSQL connection pool ready');
+  } catch (error: any) {
+    logger.warn('PostgreSQL initialization failed (will retry on first use):', error.message);
+  }
+}
+
+// Start initialization (non-blocking)
+initializeServices();
+
 // Health check needs to come BEFORE proxy routes
-app.get('/health', (req: Request, res: Response) => {
+app.get('/health', async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
+  
   res.json({ 
     status: 'healthy', 
     service: 'api-gateway',
     services: Object.keys(SERVICES),
+    connections: {
+      redis: redisHealthy ? 'connected' : 'disconnected',
+      database: dbHealthy ? 'connected' : 'disconnected'
+    },
     timestamp: new Date().toISOString() 
   });
 });
@@ -318,6 +353,259 @@ app.use((err: Error, req: Request, res: Response, next: Function) => {
     });
   }
 });
+
+// ===========================================================================
+// PERFORMANCE TEST ENDPOINTS
+// These endpoints demonstrate Redis caching and database connection pooling
+// ===========================================================================
+
+// Parse JSON for test endpoints
+app.use('/api/test', express.json());
+
+/**
+ * Test endpoint: Redis cache performance
+ * Demonstrates the speed difference between cached and uncached responses
+ */
+app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req: Request, res: Response) => {
+  const timer = new Timer();
+  
+  // Simulate some processing work
+  const data = {
+    message: 'This response can be cached in Redis',
+    timestamp: new Date().toISOString(),
+    randomValue: Math.random(),
+    processingTimeMs: timer.elapsedMs().toFixed(3)
+  };
+  
+  res.json(data);
+});
+
+/**
+ * Test endpoint: Direct Redis GET/SET operations
+ * Shows raw Redis performance with timing
+ */
+app.post('/api/test/redis-direct', async (req: Request, res: Response) => {
+  const { key, value, iterations = 1 } = req.body;
+  
+  if (!key) {
+    return res.status(400).json({ error: 'key is required' });
+  }
+  
+  const setTimings: bigint[] = [];
+  const getTimings: bigint[] = [];
+  
+  try {
+    // Perform SET operations
+    for (let i = 0; i < iterations; i++) {
+      const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
+      setTimings.push(setResult.timeNs);
+    }
+    
+    // Perform GET operations  
+    for (let i = 0; i < iterations; i++) {
+      const getResult = await redisService.get(`test:${key}:${i}`);
+      getTimings.push(getResult.timeNs);
+    }
+    
+    const setStats = calculateStats(setTimings);
+    const getStats = calculateStats(getTimings);
+    
+    res.json({
+      success: true,
+      iterations,
+      setOperations: {
+        avgMs: setStats.avgMs.toFixed(3),
+        minMs: setStats.minMs.toFixed(3),
+        maxMs: setStats.maxMs.toFixed(3),
+        medianMs: setStats.medianMs.toFixed(3),
+        p95Ms: setStats.p95Ms.toFixed(3)
+      },
+      getOperations: {
+        avgMs: getStats.avgMs.toFixed(3),
+        minMs: getStats.minMs.toFixed(3),
+        maxMs: getStats.maxMs.toFixed(3),
+        medianMs: getStats.medianMs.toFixed(3),
+        p95Ms: getStats.p95Ms.toFixed(3)
+      },
+      redisStats: redisService.getStats()
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Database query with connection pooling
+ * Shows database performance with and without Redis cache
+ */
+app.get('/api/test/db-query', async (req: Request, res: Response) => {
+  const useCache = req.query.cache !== 'false';
+  const iterations = parseInt(req.query.iterations as string) || 1;
+  const cacheKey = 'test:db:current-time';
+  
+  const timings: bigint[] = [];
+  let source: 'cache' | 'database' = 'database';
+  let lastResult: any = null;
+  
+  try {
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      
+      if (useCache) {
+        // Try cache first
+        const cached = await redisService.get(cacheKey);
+        if (cached.value !== null) {
+          lastResult = JSON.parse(cached.value);
+          source = 'cache';
+          timings.push(timer.stop());
+          continue;
+        }
+      }
+      
+      // Query database
+      const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
+      lastResult = dbResult.result.rows[0];
+      source = 'database';
+      
+      // Cache the result
+      if (useCache) {
+        await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
+      }
+      
+      timings.push(timer.stop());
+    }
+    
+    const stats = calculateStats(timings);
+    
+    res.json({
+      success: true,
+      iterations,
+      cacheEnabled: useCache,
+      source,
+      data: lastResult,
+      timing: {
+        avgMs: stats.avgMs.toFixed(3),
+        minMs: stats.minMs.toFixed(3),
+        maxMs: stats.maxMs.toFixed(3),
+        medianMs: stats.medianMs.toFixed(3),
+        p95Ms: stats.p95Ms.toFixed(3)
+      },
+      stats: {
+        redis: redisService.getStats(),
+        database: dbService.getStats()
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Compare cached vs uncached database queries
+ * This clearly demonstrates the performance improvement
+ */
+app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
+  const iterations = parseInt(req.query.iterations as string) || 10;
+  const cacheKey = 'test:db:comparison';
+  
+  // Clear any existing cache
+  await redisService.del(cacheKey);
+  
+  const uncachedTimings: bigint[] = [];
+  const cachedTimings: bigint[] = [];
+  
+  try {
+    // Run uncached queries
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
+      uncachedTimings.push(timer.stop());
+    }
+    
+    // Prime the cache with first query
+    const primeTimer = new Timer();
+    const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
+    await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
+    const primeTime = primeTimer.stop();
+    
+    // Run cached queries
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      await redisService.get(cacheKey);
+      cachedTimings.push(timer.stop());
+    }
+    
+    const uncachedStats = calculateStats(uncachedTimings);
+    const cachedStats = calculateStats(cachedTimings);
+    
+    // Calculate improvement
+    const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
+    const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
+    
+    res.json({
+      success: true,
+      iterations,
+      uncached: {
+        avgMs: uncachedStats.avgMs.toFixed(3),
+        minMs: uncachedStats.minMs.toFixed(3),
+        maxMs: uncachedStats.maxMs.toFixed(3),
+        medianMs: uncachedStats.medianMs.toFixed(3),
+        p95Ms: uncachedStats.p95Ms.toFixed(3)
+      },
+      cached: {
+        avgMs: cachedStats.avgMs.toFixed(3),
+        minMs: cachedStats.minMs.toFixed(3),
+        maxMs: cachedStats.maxMs.toFixed(3),
+        medianMs: cachedStats.medianMs.toFixed(3),
+        p95Ms: cachedStats.p95Ms.toFixed(3)
+      },
+      improvement: {
+        factor: improvementFactor.toFixed(2) + 'x faster',
+        percentReduction: improvementPercent.toFixed(1) + '%',
+        absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
+      },
+      cacheSetupTimeMs: formatDuration(primeTime)
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Get connection pool statistics
+ */
+app.get('/api/test/stats', async (req: Request, res: Response) => {
+  res.json({
+    redis: redisService.getStats(),
+    database: dbService.getStats(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+/**
+ * Test endpoint: Health check for Redis and Database
+ */
+app.get('/api/test/health', async (req: Request, res: Response) => {
+  const [redisHealthy, dbHealthy] = await Promise.all([
+    redisService.isHealthy(),
+    dbService.isHealthy()
+  ]);
+  
+  const status = redisHealthy && dbHealthy ? 'healthy' : 'degraded';
+  
+  res.status(status === 'healthy' ? 200 : 503).json({
+    status,
+    services: {
+      redis: redisHealthy ? 'connected' : 'disconnected',
+      database: dbHealthy ? 'connected' : 'disconnected'
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ===========================================================================
+// END PERFORMANCE TEST ENDPOINTS
+// ===========================================================================
 
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
