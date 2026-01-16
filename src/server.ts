@@ -64,7 +64,7 @@ const SERVICES: ServiceUrls = {
 const validateServiceUrls = () => {
   const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
-  
+
   // Log environment variables for debugging
   logger.info('Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
@@ -78,26 +78,26 @@ const validateServiceUrls = () => {
     CYREX_URL: process.env.CYREX_URL,
     LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL
   });
-  
+
   for (const service of requiredServices) {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      logger.error(`Service URL missing for ${service}:`, { 
+      logger.error(`Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
-        resolved: serviceUrl 
+        resolved: serviceUrl
       });
     }
   }
-  
+
   if (missingServices.length > 0) {
     logger.error('Missing or empty service URLs:', missingServices);
     logger.error('Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
-  
+
   logger.info('All service URLs validated successfully:', SERVICES);
 };
 
@@ -192,11 +192,11 @@ app.get('/health', async (req: Request, res: Response) => {
 // Test endpoint to verify the gateway is working
 app.post('/test', (req: Request, res: Response) => {
   logger.info('Test endpoint called', { body: req.body, headers: req.headers });
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     message: 'API Gateway is working',
     receivedBody: req.body,
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -267,12 +267,12 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
     logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    logger.error('Proxy error:', { 
-      error: err.message, 
-      target, 
+    logger.error('Proxy error:', {
+      error: err.message,
+      target,
       path: req.originalUrl || req.path,
       method: req.method,
-      stack: err.stack 
+      stack: err.stack
     });
     if (!res.headersSent) {
       res.status(503).json({ error: 'Service unavailable', message: err.message });
@@ -319,14 +319,14 @@ authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
       'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
     }
   });
-  
+
   // Ensure CORS headers are properly set from the auth service response
   // Don't overwrite them - let the auth service's CORS middleware handle it
   // But log if they're missing
   if (!proxyRes.headers['access-control-allow-origin']) {
     logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
   }
-  
+
   // Call original handler if it exists
   if (originalAuthOnProxyRes) {
     originalAuthOnProxyRes(proxyRes, req, res);
@@ -346,14 +346,14 @@ app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageInt
 
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  logger.error('Proxy error:', { 
-    error: err.message, 
+  logger.error('Proxy error:', {
+    error: err.message,
     stack: err.stack,
     path: req.path,
-    method: req.method 
+    method: req.method
   });
   if (!res.headersSent) {
-    res.status(503).json({ 
+    res.status(503).json({
       error: 'Service unavailable',
       message: err.message,
       path: req.path
@@ -617,7 +617,7 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
   logger.warn(`Unhandled route: ${req.method} ${req.path}`);
-  res.status(404).json({ 
+  res.status(404).json({
     error: 'Not found',
     path: req.path,
     method: req.method
@@ -640,8 +640,8 @@ process.on('unhandledRejection', (reason, promise) => {
 let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-logger.info('Checking realtime service URL:', { 
-  url: realtimeUrl, 
+logger.info('Checking realtime service URL:', {
+  url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
   isUndefined: realtimeUrl === undefined,
@@ -657,7 +657,9 @@ if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '')
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
-      pathFilter: (path: string) => path.startsWith('/socket.io'),
+      onProxyReqWs: (_proxyReq: any, req: any) => {
+        logger.info(`Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+      },
       onError: (err: Error, req: express.Request, res: express.Response) => {
         logger.error('Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
@@ -680,7 +682,7 @@ if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '')
 // Apply Socket.IO proxy middleware (only if configured)
 if (socketIoProxy) {
   app.use(socketIoProxy);
-  
+
   // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
