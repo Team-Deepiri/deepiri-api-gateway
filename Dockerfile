@@ -22,7 +22,7 @@ COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/package*.json ./
 USER nodejs
 
 # Now npm can create node_modules
-RUN npm ci --legacy-peer-deps && npm cache clean --force
+RUN npm install --legacy-peer-deps && npm cache clean --force
 
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/src ./src
