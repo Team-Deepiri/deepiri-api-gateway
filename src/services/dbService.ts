@@ -7,10 +7,70 @@
  * - Query execution with automatic connection release
  * - Slow query detection and logging
  * - Pool statistics and health monitoring
+ * - Prometheus metrics for monitoring
  */
 
 import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 import winston from 'winston';
+import promClient from 'prom-client';
+
+// ============================================================================
+// PROMETHEUS METRICS
+// ============================================================================
+
+// Query duration histogram (seconds)
+const dbQueryDuration = new promClient.Histogram({
+  name: 'db_query_duration_seconds',
+  help: 'Duration of database queries in seconds',
+  labelNames: ['status'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+});
+
+// Query counter by status
+const dbQueryTotal = new promClient.Counter({
+  name: 'db_queries_total',
+  help: 'Total number of database queries',
+  labelNames: ['status']  // success, error, slow
+});
+
+// Connection pool gauges
+const dbPoolTotal = new promClient.Gauge({
+  name: 'db_pool_connections_total',
+  help: 'Total number of connections in the pool'
+});
+
+const dbPoolIdle = new promClient.Gauge({
+  name: 'db_pool_connections_idle',
+  help: 'Number of idle connections in the pool'
+});
+
+const dbPoolWaiting = new promClient.Gauge({
+  name: 'db_pool_clients_waiting',
+  help: 'Number of clients waiting for a connection'
+});
+
+// Connection error counter
+const dbConnectionErrors = new promClient.Counter({
+  name: 'db_connection_errors_total',
+  help: 'Total number of database connection errors'
+});
+
+// Slow query counter
+const dbSlowQueries = new promClient.Counter({
+  name: 'db_slow_queries_total',
+  help: 'Total number of slow queries detected'
+});
+
+// Export metrics registry for /metrics endpoint
+export const dbMetrics = {
+  queryDuration: dbQueryDuration,
+  queryTotal: dbQueryTotal,
+  poolTotal: dbPoolTotal,
+  poolIdle: dbPoolIdle,
+  poolWaiting: dbPoolWaiting,
+  connectionErrors: dbConnectionErrors,
+  slowQueries: dbSlowQueries
+};
 
 const logger = winston.createLogger({
   level: 'info',
@@ -102,6 +162,7 @@ export async function initDb(): Promise<void> {
 
     pool.on('error', (err, client) => {
       stats.connectionErrors++;
+      dbConnectionErrors.inc();
       logger.error('Unexpected error on idle client:', err.message);
     });
 
@@ -136,13 +197,20 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
     const timeMs = Number(timeNs) / 1_000_000;
+    const timeSec = timeMs / 1000;
 
     stats.successfulQueries++;
     stats.totalQueryTimeNs += timeNs;
 
+    // Record Prometheus metrics
+    dbQueryDuration.observe({ status: 'success' }, timeSec);
+    dbQueryTotal.inc({ status: 'success' });
+
     // Log slow queries
     if (timeMs > SLOW_QUERY_THRESHOLD_MS) {
       stats.slowQueries++;
+      dbSlowQueries.inc();
+      dbQueryTotal.inc({ status: 'slow' });
       logger.warn('Slow query detected', {
         query: text.substring(0, 100),
         timeMs: timeMs.toFixed(3),
@@ -156,8 +224,14 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
     const timeMs = Number(timeNs) / 1_000_000;
+    const timeSec = timeMs / 1000;
 
     stats.failedQueries++;
+    
+    // Record Prometheus error metrics
+    dbQueryDuration.observe({ status: 'error' }, timeSec);
+    dbQueryTotal.inc({ status: 'error' });
+    
     logger.error('Database query error:', {
       error: error.message,
       query: text.substring(0, 100),
@@ -245,6 +319,15 @@ export async function isHealthy(): Promise<boolean> {
 }
 
 /**
+ * Update Prometheus pool gauges with current values
+ */
+export function updatePoolMetrics(): void {
+  dbPoolTotal.set(pool?.totalCount ?? 0);
+  dbPoolIdle.set(pool?.idleCount ?? 0);
+  dbPoolWaiting.set(pool?.waitingCount ?? 0);
+}
+
+/**
  * Get pool and query statistics
  */
 export function getStats(): {
@@ -259,6 +342,9 @@ export function getStats(): {
   connectionAcquires: number;
   connectionErrors: number;
 } {
+  // Update Prometheus gauges when stats are retrieved
+  updatePoolMetrics();
+  
   const avgQueryTimeMs = stats.totalQueries > 0
     ? (Number(stats.totalQueryTimeNs / BigInt(stats.totalQueries)) / 1_000_000).toFixed(3)
     : '0.000';
@@ -296,6 +382,8 @@ export default {
   getClient,
   isHealthy,
   getStats,
-  closeDb
+  updatePoolMetrics,
+  closeDb,
+  dbMetrics
 };
 
