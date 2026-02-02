@@ -6,12 +6,35 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
+import promClient from 'prom-client';
 
 // Import our new services for connection pooling
 import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+
+// ============================================================================
+// PROMETHEUS METRICS SETUP
+// ============================================================================
+
+// Collect default Node.js metrics (memory, CPU, event loop, etc.)
+promClient.collectDefaultMetrics({ prefix: 'api_gateway_' });
+
+// HTTP request duration histogram
+const httpRequestDuration = new promClient.Histogram({
+  name: 'api_gateway_http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+});
+
+// HTTP request counter
+const httpRequestTotal = new promClient.Counter({
+  name: 'api_gateway_http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code']
+});
 
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
@@ -150,6 +173,29 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
+// HTTP request timing middleware for Prometheus metrics
+app.use((req: Request, res: Response, next) => {
+  // Skip metrics for the metrics endpoint itself
+  if (req.path === '/metrics') {
+    return next();
+  }
+  
+  const end = httpRequestDuration.startTimer();
+  
+  res.on('finish', () => {
+    const route = req.route?.path || req.path.split('/').slice(0, 3).join('/') || 'unknown';
+    const labels = {
+      method: req.method,
+      route: route,
+      status_code: res.statusCode.toString()
+    };
+    end(labels);
+    httpRequestTotal.inc(labels);
+  });
+  
+  next();
+});
+
 // Initialize Redis and DB connection pools
 async function initializeServices() {
   try {
@@ -187,6 +233,20 @@ app.get('/health', async (req: Request, res: Response) => {
     },
     timestamp: new Date().toISOString() 
   });
+});
+
+// Prometheus metrics endpoint
+app.get('/metrics', async (req: Request, res: Response) => {
+  try {
+    // Update database pool metrics before serving
+    dbService.updatePoolMetrics();
+    
+    res.set('Content-Type', promClient.register.contentType);
+    res.end(await promClient.register.metrics());
+  } catch (error: any) {
+    logger.error('Error generating metrics:', error.message);
+    res.status(500).end(error.message);
+  }
 });
 
 // Test endpoint to verify the gateway is working
