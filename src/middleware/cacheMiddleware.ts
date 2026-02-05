@@ -11,13 +11,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import * as redisService from '../services/redisService';
-import winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
-});
+import { logger, secureLog } from '@deepiri/shared-utils';
 
 interface CacheOptions {
   ttlSeconds?: number;
@@ -126,7 +120,7 @@ export function cacheMiddleware(options: CacheOptions = {}) {
             });
           })
           .catch(err => {
-            logger.error('Failed to cache response:', err.message);
+            secureLog('error', 'Failed to cache response:', err.message);
           });
         
         return originalJson(body);
@@ -134,7 +128,7 @@ export function cacheMiddleware(options: CacheOptions = {}) {
 
       next();
     } catch (error: any) {
-      logger.error('Cache middleware error:', error.message);
+      secureLog('error', 'Cache middleware error:', error.message);
       // On cache error, continue without caching
       res.setHeader('X-Cache', 'ERROR');
       next();
@@ -148,7 +142,7 @@ export function cacheMiddleware(options: CacheOptions = {}) {
 export async function clearCache(pattern: string): Promise<void> {
   // Note: This is a simplified implementation
   // For production, consider using Redis SCAN with pattern matching
-  logger.info(`Cache clear requested for pattern: ${pattern}`);
+  secureLog('info', `Cache clear requested for pattern: ${pattern}`);
 }
 
 export default cacheMiddleware;
