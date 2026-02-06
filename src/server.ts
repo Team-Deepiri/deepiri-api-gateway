@@ -67,6 +67,7 @@ interface ServiceUrls {
   realtime: string;
   cyrex: string;
   languageIntelligence: string;
+  messaging: string;
 }
 
 // Service URLs with validation
@@ -80,12 +81,13 @@ const SERVICES: ServiceUrls = {
   challenge: process.env.CHALLENGE_SERVICE_URL || 'http://challenge-service:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
-  languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003'
+  languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003',
+  messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009'
 };
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence', 'messaging'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
@@ -99,7 +101,8 @@ const validateServiceUrls = () => {
     CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
     CYREX_URL: process.env.CYREX_URL,
-    LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL
+    LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL,
+    MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL
   });
 
   for (const service of requiredServices) {
@@ -136,7 +139,8 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
     challenge: 'CHALLENGE_SERVICE_URL',
     realtime: 'REALTIME_GATEWAY_URL',
     cyrex: 'CYREX_URL',
-    languageIntelligence: 'LANGUAGE_INTELLIGENCE_SERVICE_URL'
+    languageIntelligence: 'LANGUAGE_INTELLIGENCE_SERVICE_URL',
+    messaging: 'MESSAGING_SERVICE_URL'
   };
   return envMap[service];
 };
@@ -153,7 +157,8 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
     challenge: 'http://challenge-service:5007',
     realtime: 'http://realtime-gateway:5008',
     cyrex: 'http://cyrex:8000',
-    languageIntelligence: 'http://language-intelligence-service:5003'
+    languageIntelligence: 'http://language-intelligence-service:5003',
+    messaging: 'http://messaging-service:5009'
   };
   return defaults[service];
 };
@@ -403,6 +408,7 @@ app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
 app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
+app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
 
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
