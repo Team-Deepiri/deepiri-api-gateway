@@ -10,6 +10,7 @@
 
 import { createClient, RedisClientType } from 'redis';
 import winston from 'winston';
+import { retry, CircuitBreaker, CircuitOpenError } from '../utils/resilience';
 
 const logger = winston.createLogger({
   level: 'info',
@@ -49,6 +50,14 @@ const stats: RedisStats = {
 // Single Redis client (connection pooling handled by the client internally)
 let client: RedisClientType | null = null;
 let isConnected = false;
+
+// Circuit breaker for Redis operations
+const redisCircuit = new CircuitBreaker({
+  failureThreshold: parseInt(process.env.REDIS_CB_FAILURE_THRESHOLD || '5', 10),
+  successThreshold: parseInt(process.env.REDIS_CB_SUCCESS_THRESHOLD || '2', 10),
+  openStateTimeoutMs: parseInt(process.env.REDIS_CB_OPEN_TIMEOUT_MS || '60000', 10),
+  name: process.env.REDIS_CB_NAME || 'redis'
+});
 
 /**
  * Initialize Redis connection
@@ -99,7 +108,13 @@ export async function initRedis(): Promise<void> {
       isConnected = false;
     });
 
-    await client.connect();
+    // Connect with retry
+    await retry(() => client!.connect(), {
+      attempts: parseInt(process.env.REDIS_CONNECT_RETRY_ATTEMPTS || '3', 10),
+      minDelayMs: parseInt(process.env.REDIS_CONNECT_RETRY_MIN_MS || '100', 10),
+      maxDelayMs: parseInt(process.env.REDIS_CONNECT_RETRY_MAX_MS || '1000', 10),
+      op: 'redis_init'
+    });
     isConnected = true;
     logger.info('Redis connection established successfully');
   } catch (error: any) {
@@ -122,7 +137,18 @@ export async function get(key: string): Promise<{ value: string | null; timeNs: 
       throw new Error('Redis not connected');
     }
 
-    const value = await client.get(key);
+    // Use circuit breaker for runtime get
+    let value: string | null;
+    try {
+      value = await redisCircuit.execute(() => client!.get(key));
+    } catch (err: any) {
+      if (err instanceof CircuitOpenError) {
+        logger.error('Redis circuit open - GET short-circuited');
+        stats.misses++;
+        return { value: null, timeNs: process.hrtime.bigint() - startTime };
+      }
+      throw err;
+    }
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
 
@@ -159,7 +185,15 @@ export async function set(
       throw new Error('Redis not connected');
     }
 
-    await client.setEx(key, ttlSeconds, value);
+    try {
+      await redisCircuit.execute(() => client!.setEx(key, ttlSeconds, value));
+    } catch (err: any) {
+      if (err instanceof CircuitOpenError) {
+        logger.error('Redis circuit open - SET short-circuited');
+        return { success: false, timeNs: process.hrtime.bigint() - startTime };
+      }
+      throw err;
+    }
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
 
@@ -185,7 +219,15 @@ export async function del(key: string): Promise<boolean> {
       throw new Error('Redis not connected');
     }
 
-    await client.del(key);
+    try {
+      await redisCircuit.execute(() => client!.del(key));
+    } catch (err: any) {
+      if (err instanceof CircuitOpenError) {
+        logger.error('Redis circuit open - DEL short-circuited');
+        return false;
+      }
+      throw err;
+    }
     stats.deletes++;
     return true;
   } catch (error: any) {

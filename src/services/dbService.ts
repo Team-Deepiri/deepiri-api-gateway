@@ -13,6 +13,7 @@
 import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 import winston from 'winston';
 import promClient from 'prom-client';
+import { retry, CircuitBreaker, CircuitOpenError } from '../utils/resilience';
 
 // ============================================================================
 // PROMETHEUS METRICS
@@ -125,6 +126,14 @@ const stats: DbStats = {
 // Connection pool instance
 let pool: Pool | null = null;
 
+// Circuit breaker for database operations
+const dbCircuit = new CircuitBreaker({
+  failureThreshold: parseInt(process.env.DB_CB_FAILURE_THRESHOLD || '5', 10),
+  successThreshold: parseInt(process.env.DB_CB_SUCCESS_THRESHOLD || '2', 10),
+  openStateTimeoutMs: parseInt(process.env.DB_CB_OPEN_TIMEOUT_MS || '60000', 10),
+  name: process.env.DB_CB_NAME || 'database'
+});
+
 /**
  * Initialize the database connection pool
  */
@@ -166,8 +175,13 @@ export async function initDb(): Promise<void> {
       logger.error('Unexpected error on idle client:', err.message);
     });
 
-    // Test the connection
-    const testResult = await pool.query('SELECT NOW() as current_time');
+    // Test the connection (with retry)
+    const testResult = await retry(() => pool!.query('SELECT NOW() as current_time'), {
+      attempts: parseInt(process.env.DB_CONNECT_RETRY_ATTEMPTS || '3', 10),
+      minDelayMs: parseInt(process.env.DB_CONNECT_RETRY_MIN_MS || '100', 10),
+      maxDelayMs: parseInt(process.env.DB_CONNECT_RETRY_MAX_MS || '1000', 10),
+      op: 'db_init'
+    });
     logger.info('Database connection pool initialized successfully', {
       serverTime: testResult.rows[0]?.current_time
     });
@@ -193,7 +207,16 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
       throw new Error('Database pool not initialized');
     }
 
-    const result = await pool.query<T>(text, params);
+    // Use circuit breaker for query execution
+    let result: QueryResult<T>;
+    try {
+      result = await dbCircuit.execute(() => pool!.query<T>(text, params));
+    } catch (err: any) {
+      if (err instanceof CircuitOpenError) {
+        logger.error('Database circuit open - rejecting query');
+      }
+      throw err;
+    }
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
     const timeMs = Number(timeNs) / 1_000_000;
