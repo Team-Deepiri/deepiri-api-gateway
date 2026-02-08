@@ -1,3 +1,49 @@
 {
-  "_note": "Per-test stress artifact cleaned. QA can re-run tests with RESILIENCE_METRICS=1 to regenerate metrics artifacts in artifacts/"
+  "totals": {
+    "retry_attempts_total": {
+      "{\"op\":\"stress_retry\"}": 15
+    },
+    "retry_success_total": {
+      "{\"op\":\"stress_retry\"}": 6
+    },
+    "retry_failure_total": {
+      "{\"op\":\"stress_retry\"}": 9
+    },
+    "circuit_state": {
+      "{\"name\":\"stress_cb\"}": 0
+    },
+    "circuit_opens_total": {
+      "{\"name\":\"stress_cb\"}": 3
+    },
+    "circuit_short_circuits_total": {
+      "{\"name\":\"stress_cb\"}": 90
+    },
+    "circuit_success_total": {
+      "{\"name\":\"stress_cb\"}": 6
+    },
+    "circuit_failure_total": {
+      "{\"name\":\"stress_cb\"}": 3
+    },
+    "outage_requests_total": {
+      "{\"name\":\"stress_cb\"}": 90
+    },
+    "retries_avoided_total": {
+      "{\"name\":\"stress_cb\"}": 540
+    },
+    "circuit_successful_recoveries_total": {}
+  },
+  "summary": {
+    "outageCycles": 3,
+    "totalOutageRequests": 90,
+    "shortCircuited": 90,
+    "shortCircuitPct": 100,
+    "retryAttemptsObserved": 15,
+    "baselineRetries": 540,
+    "retriesAvoidedCounter": 540,
+    "retriesAvoidedComputed": 525,
+    "retryStormReduction": 525,
+    "circuitOpens": 3,
+    "successfulRecoveries": 0,
+    "recoveryRate": 0
+  }
 }

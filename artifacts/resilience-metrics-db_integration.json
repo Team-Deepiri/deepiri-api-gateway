@@ -1,3 +1,27 @@
 {
-  "_note": "Per-test artifact cleaned. QA can re-run tests with RESILIENCE_METRICS=1 to regenerate metrics artifacts in artifacts/"
+  "retry_attempts_total": {
+    "{\"op\":\"db_init\"}": 1
+  },
+  "retry_success_total": {
+    "{\"op\":\"db_init\"}": 1
+  },
+  "retry_failure_total": {},
+  "circuit_state": {
+    "{\"name\":\"database\"}": 0
+  },
+  "circuit_opens_total": {
+    "{\"name\":\"database\"}": 1
+  },
+  "circuit_short_circuits_total": {
+    "{\"name\":\"database\"}": 1
+  },
+  "circuit_success_total": {
+    "{\"name\":\"database\"}": 1
+  },
+  "circuit_failure_total": {
+    "{\"name\":\"database\"}": 1
+  },
+  "outage_requests_total": {},
+  "retries_avoided_total": {},
+  "circuit_successful_recoveries_total": {}
 }

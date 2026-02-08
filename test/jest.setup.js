@@ -6,8 +6,15 @@ const METRICS_ENABLED = process.env.RESILIENCE_METRICS === '1' || process.env.ME
 if (METRICS_ENABLED) {
   const metrics = require(path.join(__dirname, '..', 'dist', 'utils', 'metrics.js'));
 
-  beforeEach(() => {
-    if (metrics && metrics.reset) metrics.reset();
+  beforeAll(async () => {
+    // ensure metrics runtime is initialized before tests run when requested
+    if (metrics && metrics.enableMetrics) {
+      try { await metrics.enableMetrics(); } catch (e) { /* ignore */ }
+    }
+  });
+
+  beforeEach(async () => {
+    if (metrics && metrics.reset) await metrics.reset();
   });
 
   afterEach(async () => {
@@ -38,6 +45,6 @@ if (METRICS_ENABLED) {
     }
 
     // reset metrics after collecting per-test totals
-    if (metrics && metrics.reset) metrics.reset();
+    if (metrics && metrics.reset) await metrics.reset();
   });
 }
