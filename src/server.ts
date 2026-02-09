@@ -6,8 +6,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import winston from 'winston';
-<<<<<<< HEAD
 import promClient from 'prom-client';
+import rateLimit from 'express-rate-limit';
 
 // Import our new services for connection pooling
 import * as redisService from './services/redisService';
@@ -37,9 +37,6 @@ const httpRequestTotal = new promClient.Counter({
   help: 'Total number of HTTP requests',
   labelNames: ['method', 'route', 'status_code']
 });
-=======
-import rateLimit from 'express-rate-limit';
->>>>>>> origin/backend-team-dev
 
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
@@ -178,7 +175,6 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-<<<<<<< HEAD
 // HTTP request timing middleware for Prometheus metrics
 app.use((req: Request, res: Response, next) => {
   // Skip metrics for the metrics endpoint itself
@@ -238,7 +234,6 @@ app.get('/health', async (req: Request, res: Response) => {
       database: dbHealthy ? 'connected' : 'disconnected'
     },
     timestamp: new Date().toISOString() 
-=======
 app.set("trust proxy", 1);
 
 type BucketSpec = { capacity: number; refillRate: number };
@@ -564,7 +559,6 @@ app.get("/api/throttling/status", (req: Request, res: Response) => {
       maxSize: THROTTLING_CONFIG.queue.maxSize,
     },
     timestamp: new Date().toISOString(),
->>>>>>> origin/backend-team-dev
   });
 });
 
