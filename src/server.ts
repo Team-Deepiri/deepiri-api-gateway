@@ -234,6 +234,9 @@ app.get('/health', async (req: Request, res: Response) => {
       database: dbHealthy ? 'connected' : 'disconnected'
     },
     timestamp: new Date().toISOString() 
+  });
+});
+
 app.set("trust proxy", 1);
 
 type BucketSpec = { capacity: number; refillRate: number };
@@ -516,19 +519,6 @@ if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== '
   });
 }
 
-app.get("/health", (req: Request, res: Response) => {
-  res.json({
-    status: "healthy",
-    service: "api-gateway",
-    services: Object.keys(SERVICES),
-    timestamp: new Date().toISOString(),
-    throttling: {
-      globalTokens: globalTokenBucket.getTokens(),
-      authTokens: authTokenBucket.getTokens(),
-      queueLength: requestQueue.getQueueLength(),
-    },
-  });
-});
 
 app.get("/api/throttling/status", (req: Request, res: Response) => {
   const services = Object.fromEntries(
