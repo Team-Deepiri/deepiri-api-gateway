@@ -13,6 +13,7 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+import { validateBodyIfPresent } from './middleware/inputValidation';
 
 // ============================================================================
 // PROMETHEUS METRICS SETUP
@@ -291,6 +292,7 @@ app.use((req, res, next) => {
     next(error);
   }
 });
+app.use(validateBodyIfPresent());
 
 // Proxy routes with proper body restreaming
 // http-proxy-middleware handles body streaming automatically, but we need to
@@ -427,7 +429,7 @@ app.use((err: Error, req: Request, res: Response, next: Function) => {
 // ===========================================================================
 
 // Parse JSON for test endpoints
-app.use('/api/test', express.json());
+app.use('/api/test', express.json(), validateBodyIfPresent());
 
 /**
  * Test endpoint: Redis cache performance
