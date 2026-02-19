@@ -15,7 +15,7 @@
     "moduleResolution": "node",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "../../shared/deepiri-shared-utils/src/secureLogger.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.jsx", "**/*.tsx"],
   "ts-node": {
     "compilerOptions": {
