@@ -7,6 +7,7 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { secureLog } from '@deepiri/shared-utils';
 import promClient from 'prom-client';
+import rateLimit from 'express-rate-limit';
 
 // Import our new services for connection pooling
 import * as redisService from './services/redisService';
@@ -225,12 +226,336 @@ app.get('/health', async (req: Request, res: Response) => {
   res.json({ 
     status: 'healthy', 
     service: 'api-gateway',
+app.set("trust proxy", 1);
+
+type BucketSpec = { capacity: number; refillRate: number };
+
+class TokenBucket {
+  private tokens: number;
+  private lastRefill: number;
+  private readonly capacity: number;
+  private readonly refillRate: number; // tokens per ms
+
+  constructor(capacity: number, refillRatePerSecond: number) {
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.refillRate = refillRatePerSecond / 1000;
+    this.lastRefill = Date.now();
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const tokensToAdd = (now - this.lastRefill) * this.refillRate;
+    this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+
+  consume(tokens = 1): boolean {
+    this.refill();
+    if (this.tokens >= tokens) {
+      this.tokens -= tokens;
+      return true;
+    }
+    return false;
+  }
+
+  getTokens(): number {
+    this.refill();
+    return this.tokens;
+  }
+
+  getCapacity(): number {
+    return this.capacity;
+  }
+
+  getRefillRatePerSecond(): number {
+    return this.refillRate * 1000;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+class RequestQueue {
+  private queue: Array<{
+    req: Request;
+    res: Response;
+    next: Function;
+    bucket: TokenBucket;
+    bucketName: string;
+    enqueuedAt: number;
+  }> = [];
+  private processing = false;
+
+  constructor(
+    private readonly maxQueueSize = 100,
+    private readonly processDelay = 100,
+    private readonly maxWaitMs = 10_000
+  ) {}
+
+  enqueue(
+    req: Request,
+    res: Response,
+    next: Function,
+    bucket: TokenBucket,
+    bucketName: string
+  ): boolean {
+    if (this.queue.length >= this.maxQueueSize) return false;
+
+    const item = { req, res, next, bucket, bucketName, enqueuedAt: Date.now() };
+    this.queue.push(item);
+
+    res.once("close", () => {
+      const i = this.queue.indexOf(item);
+      if (i !== -1) this.queue.splice(i, 1);
+    });
+
+    void this.processQueue();
+    return true;
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
+      while (this.queue.length > 0) {
+        const now = Date.now();
+
+        // drop all timed-out requests (anywhere in the queue)
+        if (this.queue.length > 0) {
+          const stillValid: typeof this.queue = [];
+
+          for (const item of this.queue) {
+            if (now - item.enqueuedAt > this.maxWaitMs) {
+              if (!item.res.headersSent && !item.res.writableEnded) {
+                item.res.status(429).json({
+                  error: "Service temporarily overloaded",
+                  message: "Request timed out in queue. Please try again later.",
+                });
+              }
+              continue;
+            }
+            stillValid.push(item);
+          }
+
+          this.queue = stillValid;
+        }
+
+        // drop requests whose client disconnected
+        this.queue = this.queue.filter((it) => !it.res.writableEnded);
+
+        if (this.queue.length === 0) break;
+
+        // pick first request whose bucket can consume a token
+        const idx = this.queue.findIndex((it) => it.bucket.consume(1));
+        if (idx === -1) {
+          await sleep(this.processDelay);
+          continue;
+        }
+
+        const item = this.queue.splice(idx, 1)[0];
+
+        // if client already gone, skip
+        if (item.res.writableEnded) {
+          await sleep(this.processDelay);
+          continue;
+        }
+
+        item.next();
+        await sleep(this.processDelay);
+      }
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+}
+
+const intEnv = (val: string | undefined, fallback: number) => {
+  const n = Number.parseInt(val ?? "", 10);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const THROTTLING_CONFIG = {
+  global: {
+    capacity: intEnv(process.env.GLOBAL_TOKEN_CAPACITY, 50),
+    refillRate: intEnv(process.env.GLOBAL_REFILL_RATE, 10),
+  },
+  auth: {
+    capacity: intEnv(process.env.AUTH_TOKEN_CAPACITY, 20),
+    refillRate: intEnv(process.env.AUTH_REFILL_RATE, 2),
+  },
+  queue: {
+    maxSize: intEnv(process.env.MAX_QUEUE_SIZE, 50),
+    processDelay: intEnv(process.env.QUEUE_PROCESS_DELAY, 200),
+    maxWaitMs: intEnv(process.env.MAX_QUEUE_WAIT_MS, 10_000),
+  },
+};
+
+const globalTokenBucket = new TokenBucket(THROTTLING_CONFIG.global.capacity, THROTTLING_CONFIG.global.refillRate);
+const authTokenBucket = new TokenBucket(THROTTLING_CONFIG.auth.capacity, THROTTLING_CONFIG.auth.refillRate);
+const requestQueue = new RequestQueue(THROTTLING_CONFIG.queue.maxSize, THROTTLING_CONFIG.queue.processDelay, THROTTLING_CONFIG.queue.maxWaitMs);
+
+const SERVICE_SPECS: Record<string, BucketSpec> = {
+  task: { capacity: 30, refillRate: 5 },
+  analytics: { capacity: 25, refillRate: 3 },
+  realtime: { capacity: 40, refillRate: 8 },
+  notification: { capacity: 35, refillRate: 6 },
+  integration: { capacity: 20, refillRate: 2 },
+  challenge: { capacity: 25, refillRate: 4 },
+  engagement: { capacity: 30, refillRate: 5 },
+  cyrex: { capacity: 15, refillRate: 1 },
+};
+
+const serviceBuckets: Record<string, TokenBucket> = Object.fromEntries(
+  Object.entries(SERVICE_SPECS).map(([name, spec]) => [name, new TokenBucket(spec.capacity, spec.refillRate)])
+) as Record<string, TokenBucket>;
+
+const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
+  { prefix: "/api/auth", name: "auth", bucket: authTokenBucket },
+  { prefix: "/api/tasks", name: "task", bucket: serviceBuckets.task },
+  { prefix: "/api/analytics", name: "analytics", bucket: serviceBuckets.analytics },
+  { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
+  { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
+  { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
+  { prefix: "/api/challenges", name: "challenge", bucket: serviceBuckets.challenge },
+  { prefix: "/api/gamification", name: "engagement", bucket: serviceBuckets.engagement },
+  { prefix: "/api/agent", name: "cyrex", bucket: serviceBuckets.cyrex },
+];
+
+const getFullPath = (req: Request) => `${req.baseUrl}${req.path}`;
+const pickBucket = (fullPath: string) => ROUTES.find((r) => fullPath.startsWith(r.prefix));
+
+const throttlingMiddleware = (req: Request, res: Response, next: Function) => {
+  if (req.method === "OPTIONS") return next();
+
+  const clientIP = req.ip || req.socket.remoteAddress || "unknown";
+  const fullPath = getFullPath(req);
+
+  const match = pickBucket(fullPath);
+  const bucket = match?.bucket ?? globalTokenBucket;
+  const bucketName = match?.name ?? "global";
+
+  // Set rate limit headers
+  res.set('RateLimit-Limit', bucket.getCapacity().toString());
+  res.set('RateLimit-Remaining', Math.floor(bucket.getTokens()).toString());
+  res.set('RateLimit-Reset', Math.floor((Date.now() + 1000) / 1000).toString()); // Approximate next second
+
+  if (bucket.consume(1)) {
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.info(`[THROTTLE] Request allowed - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Tokens left: ${bucket.getTokens()}`);
+    }
+    return next();
+  }
+
+  const queued = requestQueue.enqueue(req, res, next, bucket, bucketName);
+  if (queued) {
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.warn(`[THROTTLE] Request queued - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Queue length: ${requestQueue.getQueueLength()}`);
+    }
+    return;
+  }
+
+  if (process.env.RATE_LIMIT_DEBUG === '1') {
+    logger.error(`[THROTTLE] Request rejected - Queue full, IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}`);
+  }
+  res.status(429).json({
+    error: "Service temporarily overloaded",
+    message: "Too many concurrent requests. Please try again later.",
+    retryAfter: "5",
+  });
+};
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: "Too many requests from this IP, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+  message: { error: "Too many authentication attempts from this IP, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+});
+
+app.use("/api", throttlingMiddleware);
+
+app.use("/api/auth", authLimiter);
+
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return generalLimiter(req, res, next);
+});
+
+// Test endpoint for rate limiting validation (only enabled in non-prod or with flag)
+if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== 'production') {
+  app.get('/api/rl-test', (req: Request, res: Response) => {
+    res.json({ 
+      ok: true, 
+      ts: new Date().toISOString(), 
+      ip: req.ip 
+    });
+  });
+}
+
+app.get("/health", (req: Request, res: Response) => {
+  res.json({
+    status: "healthy",
+    service: "api-gateway",
     services: Object.keys(SERVICES),
     connections: {
       redis: redisHealthy ? 'connected' : 'disconnected',
       database: dbHealthy ? 'connected' : 'disconnected'
     },
     timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString(),
+    throttling: {
+      globalTokens: globalTokenBucket.getTokens(),
+      authTokens: authTokenBucket.getTokens(),
+      queueLength: requestQueue.getQueueLength(),
+    },
+  });
+});
+
+app.get("/api/throttling/status", (req: Request, res: Response) => {
+  const services = Object.fromEntries(
+    Object.entries(serviceBuckets).map(([service, bucket]) => [
+      service,
+      {
+        tokens: bucket.getTokens(),
+        capacity: bucket.getCapacity(),
+        refillRate: `${bucket.getRefillRatePerSecond()} per second`,
+      },
+    ])
+  );
+
+  res.json({
+    global: {
+      tokens: globalTokenBucket.getTokens(),
+      capacity: globalTokenBucket.getCapacity(),
+      refillRate: `${globalTokenBucket.getRefillRatePerSecond()} per second`,
+    },
+    auth: {
+      tokens: authTokenBucket.getTokens(),
+      capacity: authTokenBucket.getCapacity(),
+      refillRate: `${authTokenBucket.getRefillRatePerSecond()} per second`,
+    },
+    services,
+    queue: {
+      length: requestQueue.getQueueLength(),
+      maxSize: THROTTLING_CONFIG.queue.maxSize,
+    },
+    timestamp: new Date().toISOString(),
   });
 });
 
