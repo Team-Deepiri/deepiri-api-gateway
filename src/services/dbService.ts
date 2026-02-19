@@ -11,7 +11,7 @@
  */
 
 import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
-import winston from 'winston';
+import { logger, secureLog } from '@deepiri/shared-utils';
 import promClient from 'prom-client';
 
 // ============================================================================
@@ -72,12 +72,6 @@ export const dbMetrics = {
   slowQueries: dbSlowQueries
 };
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
-});
-
 // Database configuration from environment
 const dbConfig: PoolConfig = {
   host: process.env.DB_HOST || 'postgres',
@@ -130,12 +124,12 @@ let pool: Pool | null = null;
  */
 export async function initDb(): Promise<void> {
   if (pool) {
-    logger.info('Database pool already initialized');
+    secureLog('info', 'Database pool already initialized');
     return;
   }
 
   try {
-    logger.info(`Initializing PostgreSQL connection pool...`, {
+    secureLog('info', `Initializing PostgreSQL connection pool...`, {
       host: dbConfig.host,
       port: dbConfig.port,
       database: dbConfig.database,
@@ -163,16 +157,16 @@ export async function initDb(): Promise<void> {
     pool.on('error', (err, client) => {
       stats.connectionErrors++;
       dbConnectionErrors.inc();
-      logger.error('Unexpected error on idle client:', err.message);
+      secureLog('error', 'Unexpected error on idle client:', err.message);
     });
 
     // Test the connection
     const testResult = await pool.query('SELECT NOW() as current_time');
-    logger.info('Database connection pool initialized successfully', {
+    secureLog('info', 'Database connection pool initialized successfully', {
       serverTime: testResult.rows[0]?.current_time
     });
   } catch (error: any) {
-    logger.error('Failed to initialize database pool:', error.message);
+    secureLog('error', 'Failed to initialize database pool:', error.message);
     pool = null;
     throw error;
   }
@@ -211,7 +205,7 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
       stats.slowQueries++;
       dbSlowQueries.inc();
       dbQueryTotal.inc({ status: 'slow' });
-      logger.warn('Slow query detected', {
+      secureLog('warn', 'Slow query detected', {
         query: text.substring(0, 100),
         timeMs: timeMs.toFixed(3),
         threshold: SLOW_QUERY_THRESHOLD_MS,
@@ -232,7 +226,7 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
     dbQueryDuration.observe({ status: 'error' }, timeSec);
     dbQueryTotal.inc({ status: 'error' });
     
-    logger.error('Database query error:', {
+    secureLog('error', 'Database query error:', {
       error: error.message,
       query: text.substring(0, 100),
       timeMs: timeMs.toFixed(3)
@@ -281,7 +275,7 @@ export async function queryWithCache<T extends QueryResultRow = QueryResultRow>(
   
   // Store in cache (don't await - fire and forget)
   redisService.set(cacheKey, JSON.stringify(dbResult.result.rows), cacheTtlSeconds)
-    .catch(err => logger.error('Failed to cache query result:', err.message));
+    .catch(err => secureLog('error', 'Failed to cache query result:', err.message));
 
   const totalEndTime = process.hrtime.bigint();
   return {
@@ -368,10 +362,10 @@ export function getStats(): {
  */
 export async function closeDb(): Promise<void> {
   if (pool) {
-    logger.info('Closing database connection pool...');
+    secureLog('info', 'Closing database connection pool...');
     await pool.end();
     pool = null;
-    logger.info('Database connection pool closed');
+    secureLog('info', 'Database connection pool closed');
   }
 }
 
