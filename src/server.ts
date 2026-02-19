@@ -5,7 +5,36 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import winston from 'winston';
+import { secureLog } from '@deepiri/shared-utils';
+import promClient from 'prom-client';
+
+// Import our new services for connection pooling
+import * as redisService from './services/redisService';
+import * as dbService from './services/dbService';
+import { Timer, calculateStats, formatDuration } from './utils/timing';
+import { cacheMiddleware } from './middleware/cacheMiddleware';
+
+// ============================================================================
+// PROMETHEUS METRICS SETUP
+// ============================================================================
+
+// Collect default Node.js metrics (memory, CPU, event loop, etc.)
+promClient.collectDefaultMetrics({ prefix: 'api_gateway_' });
+
+// HTTP request duration histogram
+const httpRequestDuration = new promClient.Histogram({
+  name: 'api_gateway_http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+});
+
+// HTTP request counter
+const httpRequestTotal = new promClient.Counter({
+  name: 'api_gateway_http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code']
+});
 
 // Extend Options type to include callback properties that exist at runtime
 interface ExtendedProxyOptions extends Options {
@@ -21,12 +50,6 @@ const app: Express = express();
 const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
-});
-
 interface ServiceUrls {
   auth: string;
   task: string;
@@ -37,6 +60,7 @@ interface ServiceUrls {
   challenge: string;
   realtime: string;
   cyrex: string;
+  languageIntelligence: string;
 }
 
 // Service URLs with validation
@@ -49,16 +73,17 @@ const SERVICES: ServiceUrls = {
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
   challenge: process.env.CHALLENGE_SERVICE_URL || 'http://challenge-service:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
-  cyrex: process.env.CYREX_URL || 'http://cyrex:8000'
+  cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
+  languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003'
 };
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
-  
+
   // Log environment variables for debugging
-  logger.info('Environment variables check:', {
+  secureLog('info', 'Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
     TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
     ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
@@ -67,29 +92,30 @@ const validateServiceUrls = () => {
     EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
     CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
-    CYREX_URL: process.env.CYREX_URL
+    CYREX_URL: process.env.CYREX_URL,
+    LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL
   });
-  
+
   for (const service of requiredServices) {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      logger.error(`Service URL missing for ${service}:`, { 
+      secureLog('error', `Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
-        resolved: serviceUrl 
+        resolved: serviceUrl
       });
     }
   }
-  
+
   if (missingServices.length > 0) {
-    logger.error('Missing or empty service URLs:', missingServices);
-    logger.error('Current SERVICES configuration:', SERVICES);
+    secureLog('error', 'Missing or empty service URLs:', missingServices);
+    secureLog('error', 'Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
-  
-  logger.info('All service URLs validated successfully:', SERVICES);
+
+  secureLog('info', 'All service URLs validated successfully:', SERVICES);
 };
 
 // Helper to get environment variable name
@@ -103,7 +129,8 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
     challenge: 'CHALLENGE_SERVICE_URL',
     realtime: 'REALTIME_GATEWAY_URL',
-    cyrex: 'CYREX_URL'
+    cyrex: 'CYREX_URL',
+    languageIntelligence: 'LANGUAGE_INTELLIGENCE_SERVICE_URL'
   };
   return envMap[service];
 };
@@ -119,7 +146,8 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
     integration: 'http://external-bridge-service:5006',
     challenge: 'http://challenge-service:5007',
     realtime: 'http://realtime-gateway:5008',
-    cyrex: 'http://cyrex:8000'
+    cyrex: 'http://cyrex:8000',
+    languageIntelligence: 'http://language-intelligence-service:5003'
   };
   return defaults[service];
 };
@@ -139,31 +167,97 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
+// HTTP request timing middleware for Prometheus metrics
+app.use((req: Request, res: Response, next) => {
+  // Skip metrics for the metrics endpoint itself
+  if (req.path === '/metrics') {
+    return next();
+  }
+  
+  const end = httpRequestDuration.startTimer();
+  
+  res.on('finish', () => {
+    const route = req.route?.path || req.path.split('/').slice(0, 3).join('/') || 'unknown';
+    const labels = {
+      method: req.method,
+      route: route,
+      status_code: res.statusCode.toString()
+    };
+    end(labels);
+    httpRequestTotal.inc(labels);
+  });
+  
+  next();
+});
+
+// Initialize Redis and DB connection pools
+async function initializeServices() {
+  try {
+    secureLog('info', 'Initializing Redis connection pool...');
+    await redisService.initRedis();
+    secureLog('info', 'Redis connection pool ready');
+  } catch (error: any) {
+    secureLog('warn', 'Redis initialization failed (will retry on first use):', error.message);
+  }
+
+  try {
+    secureLog('info', 'Initializing PostgreSQL connection pool...');
+    await dbService.initDb();
+    secureLog('info', 'PostgreSQL connection pool ready');
+  } catch (error: any) {
+    secureLog('warn', 'PostgreSQL initialization failed (will retry on first use):', error.message);
+  }
+}
+
+// Start initialization (non-blocking)
+initializeServices();
+
 // Health check needs to come BEFORE proxy routes
-app.get('/health', (req: Request, res: Response) => {
+app.get('/health', async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
+  
   res.json({ 
     status: 'healthy', 
     service: 'api-gateway',
     services: Object.keys(SERVICES),
+    connections: {
+      redis: redisHealthy ? 'connected' : 'disconnected',
+      database: dbHealthy ? 'connected' : 'disconnected'
+    },
     timestamp: new Date().toISOString() 
   });
 });
 
+// Prometheus metrics endpoint
+app.get('/metrics', async (req: Request, res: Response) => {
+  try {
+    // Update database pool metrics before serving
+    dbService.updatePoolMetrics();
+    
+    res.set('Content-Type', promClient.register.contentType);
+    res.end(await promClient.register.metrics());
+  } catch (error: any) {
+    secureLog('error', 'Error generating metrics:', error.message);
+    res.status(500).end(error.message);
+  }
+});
+
 // Test endpoint to verify the gateway is working
 app.post('/test', (req: Request, res: Response) => {
-  logger.info('Test endpoint called', { body: req.body, headers: req.headers });
-  res.json({ 
-    status: 'ok', 
+  secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
+  res.json({
+    status: 'ok',
     message: 'API Gateway is working',
     receivedBody: req.body,
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString()
   });
 });
 
 // Log all incoming requests BEFORE body parsing
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
-    logger.info(`[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
+    secureLog('info', `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
       headers: {
         'content-type': req.get('content-type'),
         'content-length': req.get('content-length'),
@@ -187,7 +281,7 @@ app.use((req, res, next) => {
     // Parse body only for non-proxy routes (like /health)
     express.json({ limit: '10mb', strict: false })(req, res, next);
   } catch (error) {
-    logger.error('Body parsing error:', error);
+    secureLog('error', 'Body parsing error:', error);
     next(error);
   }
 });
@@ -212,27 +306,27 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const contentType = req.get('content-type') || 'unknown';
         const contentLength = req.get('content-length') || 'unknown';
-        logger.info(`Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
+        secureLog('info', `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
           contentType,
           contentLength,
           hasBody: !!req.body
         });
       }
     } catch (error) {
-      logger.error('Error in onProxyReq:', error);
+      secureLog('error', 'Error in onProxyReq:', error);
     }
   },
   onProxyRes: (proxyRes: any, req: any, res: any) => {
     // Log response but don't modify CORS headers - let backend service handle them
-    logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
+    secureLog('info', `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    logger.error('Proxy error:', { 
-      error: err.message, 
-      target, 
+    secureLog('error', 'Proxy error:', {
+      error: err.message,
+      target,
       path: req.originalUrl || req.path,
       method: req.method,
-      stack: err.stack 
+      stack: err.stack
     });
     if (!res.headersSent) {
       res.status(503).json({ error: 'Service unavailable', message: err.message });
@@ -255,7 +349,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
   const rewrittenPath = req.path.replace(/^\//, '/auth/');
   const contentType = req.get('content-type') || 'unknown';
   const contentLength = req.get('content-length') || 'unknown';
-  logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+  secureLog('info', `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
     contentType,
     contentLength,
     headers: {
@@ -271,7 +365,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
 };
 authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
   // Log the response
-  logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+  secureLog('info', `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
     statusCode: proxyRes.statusCode,
     headers: {
       'content-type': proxyRes.headers['content-type'],
@@ -279,14 +373,14 @@ authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
       'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
     }
   });
-  
+
   // Ensure CORS headers are properly set from the auth service response
   // Don't overwrite them - let the auth service's CORS middleware handle it
   // But log if they're missing
   if (!proxyRes.headers['access-control-allow-origin']) {
-    logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
+    secureLog('warn', `[AUTH] Missing CORS headers in response from auth service`);
   }
-  
+
   // Call original handler if it exists
   if (originalAuthOnProxyRes) {
     originalAuthOnProxyRes(proxyRes, req, res);
@@ -301,17 +395,19 @@ app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.notific
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
+app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
+app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
 
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  logger.error('Proxy error:', { 
-    error: err.message, 
+  secureLog('error', 'Proxy error:', {
+    error: err.message,
     stack: err.stack,
     path: req.path,
-    method: req.method 
+    method: req.method
   });
   if (!res.headersSent) {
-    res.status(503).json({ 
+    res.status(503).json({
       error: 'Service unavailable',
       message: err.message,
       path: req.path
@@ -319,10 +415,263 @@ app.use((err: Error, req: Request, res: Response, next: Function) => {
   }
 });
 
+// ===========================================================================
+// PERFORMANCE TEST ENDPOINTS
+// These endpoints demonstrate Redis caching and database connection pooling
+// ===========================================================================
+
+// Parse JSON for test endpoints
+app.use('/api/test', express.json());
+
+/**
+ * Test endpoint: Redis cache performance
+ * Demonstrates the speed difference between cached and uncached responses
+ */
+app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req: Request, res: Response) => {
+  const timer = new Timer();
+  
+  // Simulate some processing work
+  const data = {
+    message: 'This response can be cached in Redis',
+    timestamp: new Date().toISOString(),
+    randomValue: Math.random(),
+    processingTimeMs: timer.elapsedMs().toFixed(3)
+  };
+  
+  res.json(data);
+});
+
+/**
+ * Test endpoint: Direct Redis GET/SET operations
+ * Shows raw Redis performance with timing
+ */
+app.post('/api/test/redis-direct', async (req: Request, res: Response) => {
+  const { key, value, iterations = 1 } = req.body;
+  
+  if (!key) {
+    return res.status(400).json({ error: 'key is required' });
+  }
+  
+  const setTimings: bigint[] = [];
+  const getTimings: bigint[] = [];
+  
+  try {
+    // Perform SET operations
+    for (let i = 0; i < iterations; i++) {
+      const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
+      setTimings.push(setResult.timeNs);
+    }
+    
+    // Perform GET operations  
+    for (let i = 0; i < iterations; i++) {
+      const getResult = await redisService.get(`test:${key}:${i}`);
+      getTimings.push(getResult.timeNs);
+    }
+    
+    const setStats = calculateStats(setTimings);
+    const getStats = calculateStats(getTimings);
+    
+    res.json({
+      success: true,
+      iterations,
+      setOperations: {
+        avgMs: setStats.avgMs.toFixed(3),
+        minMs: setStats.minMs.toFixed(3),
+        maxMs: setStats.maxMs.toFixed(3),
+        medianMs: setStats.medianMs.toFixed(3),
+        p95Ms: setStats.p95Ms.toFixed(3)
+      },
+      getOperations: {
+        avgMs: getStats.avgMs.toFixed(3),
+        minMs: getStats.minMs.toFixed(3),
+        maxMs: getStats.maxMs.toFixed(3),
+        medianMs: getStats.medianMs.toFixed(3),
+        p95Ms: getStats.p95Ms.toFixed(3)
+      },
+      redisStats: redisService.getStats()
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Database query with connection pooling
+ * Shows database performance with and without Redis cache
+ */
+app.get('/api/test/db-query', async (req: Request, res: Response) => {
+  const useCache = req.query.cache !== 'false';
+  const iterations = parseInt(req.query.iterations as string) || 1;
+  const cacheKey = 'test:db:current-time';
+  
+  const timings: bigint[] = [];
+  let source: 'cache' | 'database' = 'database';
+  let lastResult: any = null;
+  
+  try {
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      
+      if (useCache) {
+        // Try cache first
+        const cached = await redisService.get(cacheKey);
+        if (cached.value !== null) {
+          lastResult = JSON.parse(cached.value);
+          source = 'cache';
+          timings.push(timer.stop());
+          continue;
+        }
+      }
+      
+      // Query database
+      const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
+      lastResult = dbResult.result.rows[0];
+      source = 'database';
+      
+      // Cache the result
+      if (useCache) {
+        await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
+      }
+      
+      timings.push(timer.stop());
+    }
+    
+    const stats = calculateStats(timings);
+    
+    res.json({
+      success: true,
+      iterations,
+      cacheEnabled: useCache,
+      source,
+      data: lastResult,
+      timing: {
+        avgMs: stats.avgMs.toFixed(3),
+        minMs: stats.minMs.toFixed(3),
+        maxMs: stats.maxMs.toFixed(3),
+        medianMs: stats.medianMs.toFixed(3),
+        p95Ms: stats.p95Ms.toFixed(3)
+      },
+      stats: {
+        redis: redisService.getStats(),
+        database: dbService.getStats()
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Compare cached vs uncached database queries
+ * This clearly demonstrates the performance improvement
+ */
+app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
+  const iterations = parseInt(req.query.iterations as string) || 10;
+  const cacheKey = 'test:db:comparison';
+  
+  // Clear any existing cache
+  await redisService.del(cacheKey);
+  
+  const uncachedTimings: bigint[] = [];
+  const cachedTimings: bigint[] = [];
+  
+  try {
+    // Run uncached queries
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
+      uncachedTimings.push(timer.stop());
+    }
+    
+    // Prime the cache with first query
+    const primeTimer = new Timer();
+    const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
+    await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
+    const primeTime = primeTimer.stop();
+    
+    // Run cached queries
+    for (let i = 0; i < iterations; i++) {
+      const timer = new Timer();
+      await redisService.get(cacheKey);
+      cachedTimings.push(timer.stop());
+    }
+    
+    const uncachedStats = calculateStats(uncachedTimings);
+    const cachedStats = calculateStats(cachedTimings);
+    
+    // Calculate improvement
+    const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
+    const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
+    
+    res.json({
+      success: true,
+      iterations,
+      uncached: {
+        avgMs: uncachedStats.avgMs.toFixed(3),
+        minMs: uncachedStats.minMs.toFixed(3),
+        maxMs: uncachedStats.maxMs.toFixed(3),
+        medianMs: uncachedStats.medianMs.toFixed(3),
+        p95Ms: uncachedStats.p95Ms.toFixed(3)
+      },
+      cached: {
+        avgMs: cachedStats.avgMs.toFixed(3),
+        minMs: cachedStats.minMs.toFixed(3),
+        maxMs: cachedStats.maxMs.toFixed(3),
+        medianMs: cachedStats.medianMs.toFixed(3),
+        p95Ms: cachedStats.p95Ms.toFixed(3)
+      },
+      improvement: {
+        factor: improvementFactor.toFixed(2) + 'x faster',
+        percentReduction: improvementPercent.toFixed(1) + '%',
+        absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
+      },
+      cacheSetupTimeMs: formatDuration(primeTime)
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Test endpoint: Get connection pool statistics
+ */
+app.get('/api/test/stats', async (req: Request, res: Response) => {
+  res.json({
+    redis: redisService.getStats(),
+    database: dbService.getStats(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+/**
+ * Test endpoint: Health check for Redis and Database
+ */
+app.get('/api/test/health', async (req: Request, res: Response) => {
+  const [redisHealthy, dbHealthy] = await Promise.all([
+    redisService.isHealthy(),
+    dbService.isHealthy()
+  ]);
+  
+  const status = redisHealthy && dbHealthy ? 'healthy' : 'degraded';
+  
+  res.status(status === 'healthy' ? 200 : 503).json({
+    status,
+    services: {
+      redis: redisHealthy ? 'connected' : 'disconnected',
+      database: dbHealthy ? 'connected' : 'disconnected'
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ===========================================================================
+// END PERFORMANCE TEST ENDPOINTS
+// ===========================================================================
+
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
-  logger.warn(`Unhandled route: ${req.method} ${req.path}`);
-  res.status(404).json({ 
+  secureLog('warn', `Unhandled route: ${req.method} ${req.path}`);
+  res.status(404).json({
     error: 'Not found',
     path: req.path,
     method: req.method
@@ -331,12 +680,12 @@ app.use((req: Request, res: Response) => {
 
 // Add unhandled error handlers
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error);
+  secureLog('error', 'Uncaught Exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  secureLog('error', 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
 });
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
@@ -345,8 +694,8 @@ process.on('unhandledRejection', (reason, promise) => {
 let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-logger.info('Checking realtime service URL:', { 
-  url: realtimeUrl, 
+secureLog('info', 'Checking realtime service URL:', {
+  url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
   isUndefined: realtimeUrl === undefined,
@@ -356,27 +705,29 @@ logger.info('Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    secureLog('info', `Initializing Socket.IO proxy to: ${realtimeUrl}`);
     socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
-      pathFilter: (path: string) => path.startsWith('/socket.io'),
+      onProxyReqWs: (_proxyReq: any, req: any) => {
+        secureLog('info', `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+      },
       onError: (err: Error, req: express.Request, res: express.Response) => {
-        logger.error('Socket.IO proxy error:', err.message);
+        secureLog('error', 'Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
     } as any);
-    logger.info('Socket.IO proxy initialized successfully');
+    secureLog('info', 'Socket.IO proxy initialized successfully');
   } catch (error: any) {
-    logger.error('Failed to create Socket.IO proxy:', error.message);
+    secureLog('error', 'Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
   }
 } else {
-  logger.warn('REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
+  secureLog('warn', 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
     realtimeUrl,
     envVar: process.env.REALTIME_GATEWAY_URL
   });
@@ -385,11 +736,11 @@ if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '')
 // Apply Socket.IO proxy middleware (only if configured)
 if (socketIoProxy) {
   app.use(socketIoProxy);
-  
+
   // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.info(`WebSocket upgrade request: ${req.url}`);
+      secureLog('info', `WebSocket upgrade request: ${req.url}`);
       (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
@@ -399,7 +750,7 @@ if (socketIoProxy) {
   // If Socket.IO proxy is not configured, handle WebSocket requests gracefully
   httpServer.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.warn('WebSocket upgrade requested but realtime service not configured');
+      secureLog('warn', 'WebSocket upgrade requested but realtime service not configured');
       socket.destroy();
     } else {
       socket.destroy();
@@ -408,13 +759,13 @@ if (socketIoProxy) {
 }
 
 httpServer.listen(PORT, () => {
-  logger.info(`API Gateway running on port ${PORT}`);
-  logger.info('Proxying to services:', SERVICES);
-  logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
+  secureLog('info', `API Gateway running on port ${PORT}`);
+  secureLog('info', 'Proxying to services:', SERVICES);
+  secureLog('info', 'WebSocket support enabled for Socket.IO -> realtime gateway');
 }).on('error', (error: any) => {
-  logger.error('Server error:', error);
+  secureLog('error', 'Server error:', error);
   if (error.code === 'EADDRINUSE') {
-    logger.error(`Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
+    secureLog('error', `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
     process.exit(1);
   }
 });
