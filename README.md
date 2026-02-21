@@ -13,6 +13,6 @@ Routes requests to appropriate microservices.
 - All `/api/*` routes are handled here
 - Routes to appropriate microservices based on path
 
-## Implementation
-To be implemented by Backend Lead and Systems Architects.
+
+
 
