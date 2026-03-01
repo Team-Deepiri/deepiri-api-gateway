@@ -14,7 +14,14 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
-import { validateBody, validateRedisDirectBody } from './middleware/inputValidation';
+import {
+  validateBody,
+  validateHeaders,
+  validateQuery,
+  validateRedisDirectBody,
+  validateDbQueryParams,
+  validateDbComparisonQueryParams,
+} from './middleware/inputValidation';
 
 // ============================================================================
 // PROMETHEUS METRICS SETUP
@@ -580,15 +587,19 @@ app.get('/metrics', async (req: Request, res: Response) => {
 });
 
 // Test endpoint to verify the gateway is working
-app.post('/test', validateBody({ required: true }), (req: Request, res: Response) => {
-  secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
-  res.json({
-    status: 'ok',
-    message: 'API Gateway is working',
-    receivedBody: req.body,
-    timestamp: new Date().toISOString()
+app.post(
+  '/test',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateBody({ required: true }),
+  (req: Request, res: Response) => {
+    secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
+    res.json({
+      status: 'ok',
+      message: 'API Gateway is working',
+      receivedBody: req.body,
+      timestamp: new Date().toISOString()
+    });
   });
-});
 
 // Log all incoming requests BEFORE body parsing
 app.use((req, res, next) => {
@@ -784,6 +795,7 @@ app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req
  */
 app.post(
   '/api/test/redis-direct',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
   validateBody({
     required: true,
     allowedFields: ['key', 'value', 'iterations'],
@@ -844,138 +856,152 @@ app.post(
  * Test endpoint: Database query with connection pooling
  * Shows database performance with and without Redis cache
  */
-app.get('/api/test/db-query', async (req: Request, res: Response) => {
-  const useCache = req.query.cache !== 'false';
-  const iterations = parseInt(req.query.iterations as string) || 1;
-  const cacheKey = 'test:db:current-time';
+app.get(
+  '/api/test/db-query',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateQuery({
+    allowedFields: ['cache', 'iterations'],
+    validators: [validateDbQueryParams],
+  }),
+  async (req: Request, res: Response) => {
+    const useCache = req.query.cache !== 'false';
+    const iterations = parseInt(req.query.iterations as string) || 1;
+    const cacheKey = 'test:db:current-time';
 
-  const timings: bigint[] = [];
-  let source: 'cache' | 'database' = 'database';
-  let lastResult: any = null;
+    const timings: bigint[] = [];
+    let source: 'cache' | 'database' = 'database';
+    let lastResult: any = null;
 
-  try {
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
+    try {
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
 
-      if (useCache) {
-        // Try cache first
-        const cached = await redisService.get(cacheKey);
-        if (cached.value !== null) {
-          lastResult = JSON.parse(cached.value);
-          source = 'cache';
-          timings.push(timer.stop());
-          continue;
+        if (useCache) {
+          // Try cache first
+          const cached = await redisService.get(cacheKey);
+          if (cached.value !== null) {
+            lastResult = JSON.parse(cached.value);
+            source = 'cache';
+            timings.push(timer.stop());
+            continue;
+          }
         }
+
+        // Query database
+        const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
+        lastResult = dbResult.result.rows[0];
+        source = 'database';
+
+        // Cache the result
+        if (useCache) {
+          await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
+        }
+
+        timings.push(timer.stop());
       }
 
-      // Query database
-      const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
-      lastResult = dbResult.result.rows[0];
-      source = 'database';
+      const stats = calculateStats(timings);
 
-      // Cache the result
-      if (useCache) {
-        await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
-      }
-
-      timings.push(timer.stop());
+      res.json({
+        success: true,
+        iterations,
+        cacheEnabled: useCache,
+        source,
+        data: lastResult,
+        timing: {
+          avgMs: stats.avgMs.toFixed(3),
+          minMs: stats.minMs.toFixed(3),
+          maxMs: stats.maxMs.toFixed(3),
+          medianMs: stats.medianMs.toFixed(3),
+          p95Ms: stats.p95Ms.toFixed(3)
+        },
+        stats: {
+          redis: redisService.getStats(),
+          database: dbService.getStats()
+        }
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-
-    const stats = calculateStats(timings);
-
-    res.json({
-      success: true,
-      iterations,
-      cacheEnabled: useCache,
-      source,
-      data: lastResult,
-      timing: {
-        avgMs: stats.avgMs.toFixed(3),
-        minMs: stats.minMs.toFixed(3),
-        maxMs: stats.maxMs.toFixed(3),
-        medianMs: stats.medianMs.toFixed(3),
-        p95Ms: stats.p95Ms.toFixed(3)
-      },
-      stats: {
-        redis: redisService.getStats(),
-        database: dbService.getStats()
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  });
 
 /**
  * Test endpoint: Compare cached vs uncached database queries
  * This clearly demonstrates the performance improvement
  */
-app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
-  const iterations = parseInt(req.query.iterations as string) || 10;
-  const cacheKey = 'test:db:comparison';
+app.get(
+  '/api/test/db-comparison',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateQuery({
+    allowedFields: ['iterations'],
+    validators: [validateDbComparisonQueryParams],
+  }),
+  async (req: Request, res: Response) => {
+    const iterations = parseInt(req.query.iterations as string) || 10;
+    const cacheKey = 'test:db:comparison';
 
-  // Clear any existing cache
-  await redisService.del(cacheKey);
+    // Clear any existing cache
+    await redisService.del(cacheKey);
 
-  const uncachedTimings: bigint[] = [];
-  const cachedTimings: bigint[] = [];
+    const uncachedTimings: bigint[] = [];
+    const cachedTimings: bigint[] = [];
 
-  try {
-    // Run uncached queries
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
-      await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
-      uncachedTimings.push(timer.stop());
+    try {
+      // Run uncached queries
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
+        await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
+        uncachedTimings.push(timer.stop());
+      }
+
+      // Prime the cache with first query
+      const primeTimer = new Timer();
+      const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
+      await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
+      const primeTime = primeTimer.stop();
+
+      // Run cached queries
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
+        await redisService.get(cacheKey);
+        cachedTimings.push(timer.stop());
+      }
+
+      const uncachedStats = calculateStats(uncachedTimings);
+      const cachedStats = calculateStats(cachedTimings);
+
+      // Calculate improvement
+      const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
+      const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
+
+      res.json({
+        success: true,
+        iterations,
+        uncached: {
+          avgMs: uncachedStats.avgMs.toFixed(3),
+          minMs: uncachedStats.minMs.toFixed(3),
+          maxMs: uncachedStats.maxMs.toFixed(3),
+          medianMs: uncachedStats.medianMs.toFixed(3),
+          p95Ms: uncachedStats.p95Ms.toFixed(3)
+        },
+        cached: {
+          avgMs: cachedStats.avgMs.toFixed(3),
+          minMs: cachedStats.minMs.toFixed(3),
+          maxMs: cachedStats.maxMs.toFixed(3),
+          medianMs: cachedStats.medianMs.toFixed(3),
+          p95Ms: cachedStats.p95Ms.toFixed(3)
+        },
+        improvement: {
+          factor: improvementFactor.toFixed(2) + 'x faster',
+          percentReduction: improvementPercent.toFixed(1) + '%',
+          absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
+        },
+        cacheSetupTimeMs: formatDuration(primeTime)
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-
-    // Prime the cache with first query
-    const primeTimer = new Timer();
-    const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
-    await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
-    const primeTime = primeTimer.stop();
-
-    // Run cached queries
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
-      await redisService.get(cacheKey);
-      cachedTimings.push(timer.stop());
-    }
-
-    const uncachedStats = calculateStats(uncachedTimings);
-    const cachedStats = calculateStats(cachedTimings);
-
-    // Calculate improvement
-    const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
-    const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
-
-    res.json({
-      success: true,
-      iterations,
-      uncached: {
-        avgMs: uncachedStats.avgMs.toFixed(3),
-        minMs: uncachedStats.minMs.toFixed(3),
-        maxMs: uncachedStats.maxMs.toFixed(3),
-        medianMs: uncachedStats.medianMs.toFixed(3),
-        p95Ms: uncachedStats.p95Ms.toFixed(3)
-      },
-      cached: {
-        avgMs: cachedStats.avgMs.toFixed(3),
-        minMs: cachedStats.minMs.toFixed(3),
-        maxMs: cachedStats.maxMs.toFixed(3),
-        medianMs: cachedStats.medianMs.toFixed(3),
-        p95Ms: cachedStats.p95Ms.toFixed(3)
-      },
-      improvement: {
-        factor: improvementFactor.toFixed(2) + 'x faster',
-        percentReduction: improvementPercent.toFixed(1) + '%',
-        absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
-      },
-      cacheSetupTimeMs: formatDuration(primeTime)
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  });
 
 /**
  * Test endpoint: Get connection pool statistics
