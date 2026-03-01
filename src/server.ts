@@ -5,7 +5,7 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog } from '@deepiri/shared-utils';
+import { logger } from '@deepiri/shared-utils';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';
 
@@ -14,6 +14,7 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+import { validateBody, validateRedisDirectBody } from './middleware/inputValidation';
 
 // ============================================================================
 // PROMETHEUS METRICS SETUP
@@ -50,6 +51,15 @@ dotenv.config();
 const app: Express = express();
 const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
+
+const secureLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: unknown): void => {
+  const logMethod = (logger as any)[level] ?? logger.info;
+  if (meta !== undefined) {
+    logMethod(message, meta);
+    return;
+  }
+  logMethod(message);
+};
 
 interface ServiceUrls {
   auth: string;
@@ -179,9 +189,9 @@ app.use((req: Request, res: Response, next) => {
   if (req.path === '/metrics') {
     return next();
   }
-  
+
   const end = httpRequestDuration.startTimer();
-  
+
   res.on('finish', () => {
     const route = req.route?.path || req.path.split('/').slice(0, 3).join('/') || 'unknown';
     const labels = {
@@ -192,7 +202,7 @@ app.use((req: Request, res: Response, next) => {
     end(labels);
     httpRequestTotal.inc(labels);
   });
-  
+
   next();
 });
 
@@ -218,14 +228,6 @@ async function initializeServices() {
 // Start initialization (non-blocking)
 initializeServices();
 
-// Health check needs to come BEFORE proxy routes
-app.get('/health', async (req: Request, res: Response) => {
-  const redisHealthy = await redisService.isHealthy();
-  const dbHealthy = await dbService.isHealthy();
-  
-  res.json({ 
-    status: 'healthy', 
-    service: 'api-gateway',
 app.set("trust proxy", 1);
 
 type BucketSpec = { capacity: number; refillRate: number };
@@ -290,7 +292,7 @@ class RequestQueue {
     private readonly maxQueueSize = 100,
     private readonly processDelay = 100,
     private readonly maxWaitMs = 10_000
-  ) {}
+  ) { }
 
   enqueue(
     req: Request,
@@ -500,15 +502,20 @@ app.use("/api", (req, res, next) => {
 // Test endpoint for rate limiting validation (only enabled in non-prod or with flag)
 if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== 'production') {
   app.get('/api/rl-test', (req: Request, res: Response) => {
-    res.json({ 
-      ok: true, 
-      ts: new Date().toISOString(), 
-      ip: req.ip 
+    res.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      ip: req.ip
     });
   });
 }
 
-app.get("/health", (req: Request, res: Response) => {
+app.get("/health", async (req: Request, res: Response) => {
+  const [redisHealthy, dbHealthy] = await Promise.all([
+    redisService.isHealthy(),
+    dbService.isHealthy()
+  ]);
+
   res.json({
     status: "healthy",
     service: "api-gateway",
@@ -517,7 +524,6 @@ app.get("/health", (req: Request, res: Response) => {
       redis: redisHealthy ? 'connected' : 'disconnected',
       database: dbHealthy ? 'connected' : 'disconnected'
     },
-    timestamp: new Date().toISOString() 
     timestamp: new Date().toISOString(),
     throttling: {
       globalTokens: globalTokenBucket.getTokens(),
@@ -564,7 +570,7 @@ app.get('/metrics', async (req: Request, res: Response) => {
   try {
     // Update database pool metrics before serving
     dbService.updatePoolMetrics();
-    
+
     res.set('Content-Type', promClient.register.contentType);
     res.end(await promClient.register.metrics());
   } catch (error: any) {
@@ -574,7 +580,7 @@ app.get('/metrics', async (req: Request, res: Response) => {
 });
 
 // Test endpoint to verify the gateway is working
-app.post('/test', (req: Request, res: Response) => {
+app.post('/test', validateBody({ required: true }), (req: Request, res: Response) => {
   secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
   res.json({
     status: 'ok',
@@ -760,7 +766,7 @@ app.use('/api/test', express.json());
  */
 app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req: Request, res: Response) => {
   const timer = new Timer();
-  
+
   // Simulate some processing work
   const data = {
     message: 'This response can be cached in Redis',
@@ -768,7 +774,7 @@ app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req
     randomValue: Math.random(),
     processingTimeMs: timer.elapsedMs().toFixed(3)
   };
-  
+
   res.json(data);
 });
 
@@ -776,55 +782,63 @@ app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req
  * Test endpoint: Direct Redis GET/SET operations
  * Shows raw Redis performance with timing
  */
-app.post('/api/test/redis-direct', async (req: Request, res: Response) => {
-  const { key, value, iterations = 1 } = req.body;
-  
-  if (!key) {
-    return res.status(400).json({ error: 'key is required' });
-  }
-  
-  const setTimings: bigint[] = [];
-  const getTimings: bigint[] = [];
-  
-  try {
-    // Perform SET operations
-    for (let i = 0; i < iterations; i++) {
-      const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
-      setTimings.push(setResult.timeNs);
+app.post(
+  '/api/test/redis-direct',
+  validateBody({
+    required: true,
+    allowedFields: ['key', 'value', 'iterations'],
+    validators: [validateRedisDirectBody],
+  }),
+  async (req: Request, res: Response) => {
+    const { key, value, iterations = 1 } = req.body;
+
+    if (!key) {
+      return res.status(400).json({ error: 'key is required' });
     }
-    
-    // Perform GET operations  
-    for (let i = 0; i < iterations; i++) {
-      const getResult = await redisService.get(`test:${key}:${i}`);
-      getTimings.push(getResult.timeNs);
+
+    const setTimings: bigint[] = [];
+    const getTimings: bigint[] = [];
+
+    try {
+      // Perform SET operations
+      for (let i = 0; i < iterations; i++) {
+        const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
+        setTimings.push(setResult.timeNs);
+      }
+
+      // Perform GET operations
+      for (let i = 0; i < iterations; i++) {
+        const getResult = await redisService.get(`test:${key}:${i}`);
+        getTimings.push(getResult.timeNs);
+      }
+
+      const setStats = calculateStats(setTimings);
+      const getStats = calculateStats(getTimings);
+
+      res.json({
+        success: true,
+        iterations,
+        setOperations: {
+          avgMs: setStats.avgMs.toFixed(3),
+          minMs: setStats.minMs.toFixed(3),
+          maxMs: setStats.maxMs.toFixed(3),
+          medianMs: setStats.medianMs.toFixed(3),
+          p95Ms: setStats.p95Ms.toFixed(3)
+        },
+        getOperations: {
+          avgMs: getStats.avgMs.toFixed(3),
+          minMs: getStats.minMs.toFixed(3),
+          maxMs: getStats.maxMs.toFixed(3),
+          medianMs: getStats.medianMs.toFixed(3),
+          p95Ms: getStats.p95Ms.toFixed(3)
+        },
+        redisStats: redisService.getStats()
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-    
-    const setStats = calculateStats(setTimings);
-    const getStats = calculateStats(getTimings);
-    
-    res.json({
-      success: true,
-      iterations,
-      setOperations: {
-        avgMs: setStats.avgMs.toFixed(3),
-        minMs: setStats.minMs.toFixed(3),
-        maxMs: setStats.maxMs.toFixed(3),
-        medianMs: setStats.medianMs.toFixed(3),
-        p95Ms: setStats.p95Ms.toFixed(3)
-      },
-      getOperations: {
-        avgMs: getStats.avgMs.toFixed(3),
-        minMs: getStats.minMs.toFixed(3),
-        maxMs: getStats.maxMs.toFixed(3),
-        medianMs: getStats.medianMs.toFixed(3),
-        p95Ms: getStats.p95Ms.toFixed(3)
-      },
-      redisStats: redisService.getStats()
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
   }
-});
+);
 
 /**
  * Test endpoint: Database query with connection pooling
@@ -834,15 +848,15 @@ app.get('/api/test/db-query', async (req: Request, res: Response) => {
   const useCache = req.query.cache !== 'false';
   const iterations = parseInt(req.query.iterations as string) || 1;
   const cacheKey = 'test:db:current-time';
-  
+
   const timings: bigint[] = [];
   let source: 'cache' | 'database' = 'database';
   let lastResult: any = null;
-  
+
   try {
     for (let i = 0; i < iterations; i++) {
       const timer = new Timer();
-      
+
       if (useCache) {
         // Try cache first
         const cached = await redisService.get(cacheKey);
@@ -853,22 +867,22 @@ app.get('/api/test/db-query', async (req: Request, res: Response) => {
           continue;
         }
       }
-      
+
       // Query database
       const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
       lastResult = dbResult.result.rows[0];
       source = 'database';
-      
+
       // Cache the result
       if (useCache) {
         await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
       }
-      
+
       timings.push(timer.stop());
     }
-    
+
     const stats = calculateStats(timings);
-    
+
     res.json({
       success: true,
       iterations,
@@ -899,13 +913,13 @@ app.get('/api/test/db-query', async (req: Request, res: Response) => {
 app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
   const iterations = parseInt(req.query.iterations as string) || 10;
   const cacheKey = 'test:db:comparison';
-  
+
   // Clear any existing cache
   await redisService.del(cacheKey);
-  
+
   const uncachedTimings: bigint[] = [];
   const cachedTimings: bigint[] = [];
-  
+
   try {
     // Run uncached queries
     for (let i = 0; i < iterations; i++) {
@@ -913,27 +927,27 @@ app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
       await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
       uncachedTimings.push(timer.stop());
     }
-    
+
     // Prime the cache with first query
     const primeTimer = new Timer();
     const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
     await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
     const primeTime = primeTimer.stop();
-    
+
     // Run cached queries
     for (let i = 0; i < iterations; i++) {
       const timer = new Timer();
       await redisService.get(cacheKey);
       cachedTimings.push(timer.stop());
     }
-    
+
     const uncachedStats = calculateStats(uncachedTimings);
     const cachedStats = calculateStats(cachedTimings);
-    
+
     // Calculate improvement
     const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
     const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
-    
+
     res.json({
       success: true,
       iterations,
@@ -982,9 +996,9 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
     redisService.isHealthy(),
     dbService.isHealthy()
   ]);
-  
+
   const status = redisHealthy && dbHealthy ? 'healthy' : 'degraded';
-  
+
   res.status(status === 'healthy' ? 200 : 503).json({
     status,
     services: {
