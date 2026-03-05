@@ -32,7 +32,6 @@ const logger = winston.createLogger({
   format: winston.format.json(),
   transports: [new winston.transports.Console({ format: winston.format.simple() })]
 });
-platform-services/backend/deepiri-api-gateway/src/server.ts
 interface ServiceUrls {
   auth: string;
   task: string;
