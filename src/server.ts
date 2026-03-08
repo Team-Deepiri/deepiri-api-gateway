@@ -5,7 +5,7 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog } from '@deepiri/shared-utils';
+import {logger, secureLog } from '@deepiri/shared-utils';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';
 
@@ -218,14 +218,6 @@ async function initializeServices() {
 // Start initialization (non-blocking)
 initializeServices();
 
-// Health check needs to come BEFORE proxy routes
-app.get('/health', async (req: Request, res: Response) => {
-  const redisHealthy = await redisService.isHealthy();
-  const dbHealthy = await dbService.isHealthy();
-  
-  res.json({ 
-    status: 'healthy', 
-    service: 'api-gateway',
 app.set("trust proxy", 1);
 
 type BucketSpec = { capacity: number; refillRate: number };
@@ -508,7 +500,9 @@ if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== '
   });
 }
 
-app.get("/health", (req: Request, res: Response) => {
+app.get("/health", async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
   res.json({
     status: "healthy",
     service: "api-gateway",
@@ -517,7 +511,6 @@ app.get("/health", (req: Request, res: Response) => {
       redis: redisHealthy ? 'connected' : 'disconnected',
       database: dbHealthy ? 'connected' : 'disconnected'
     },
-    timestamp: new Date().toISOString() 
     timestamp: new Date().toISOString(),
     throttling: {
       globalTokens: globalTokenBucket.getTokens(),
