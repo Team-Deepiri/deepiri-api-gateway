@@ -5,7 +5,7 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog } from '@deepiri/shared-utils';
+import { secureLog, createLogger } from '@deepiri/shared-utils';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';
 
@@ -50,6 +50,7 @@ dotenv.config();
 const app: Express = express();
 const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
+const logger = createLogger('api-gateway');
 
 interface ServiceUrls {
   auth: string;
@@ -161,6 +162,7 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
 // Validate on startup
 validateServiceUrls();
 
+app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
@@ -226,7 +228,10 @@ app.get('/health', async (req: Request, res: Response) => {
   res.json({ 
     status: 'healthy', 
     service: 'api-gateway',
-app.set("trust proxy", 1);
+    redis: redisHealthy ? 'healthy' : 'unhealthy',
+    database: dbHealthy ? 'healthy' : 'unhealthy'
+  });
+});
 
 type BucketSpec = { capacity: number; refillRate: number };
 
@@ -507,25 +512,6 @@ if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== '
     });
   });
 }
-
-app.get("/health", (req: Request, res: Response) => {
-  res.json({
-    status: "healthy",
-    service: "api-gateway",
-    services: Object.keys(SERVICES),
-    connections: {
-      redis: redisHealthy ? 'connected' : 'disconnected',
-      database: dbHealthy ? 'connected' : 'disconnected'
-    },
-    timestamp: new Date().toISOString() 
-    timestamp: new Date().toISOString(),
-    throttling: {
-      globalTokens: globalTokenBucket.getTokens(),
-      authTokens: authTokenBucket.getTokens(),
-      queueLength: requestQueue.getQueueLength(),
-    },
-  });
-});
 
 app.get("/api/throttling/status", (req: Request, res: Response) => {
   const services = Object.fromEntries(
