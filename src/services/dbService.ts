@@ -7,16 +7,70 @@
  * - Query execution with automatic connection release
  * - Slow query detection and logging
  * - Pool statistics and health monitoring
+ * - Prometheus metrics for monitoring
  */
 
 import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
-import winston from 'winston';
+import { logger, secureLog } from '@deepiri/shared-utils';
+import promClient from 'prom-client';
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
+// ============================================================================
+// PROMETHEUS METRICS
+// ============================================================================
+
+// Query duration histogram (seconds)
+const dbQueryDuration = new promClient.Histogram({
+  name: 'db_query_duration_seconds',
+  help: 'Duration of database queries in seconds',
+  labelNames: ['status'],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
 });
+
+// Query counter by status
+const dbQueryTotal = new promClient.Counter({
+  name: 'db_queries_total',
+  help: 'Total number of database queries',
+  labelNames: ['status']  // success, error, slow
+});
+
+// Connection pool gauges
+const dbPoolTotal = new promClient.Gauge({
+  name: 'db_pool_connections_total',
+  help: 'Total number of connections in the pool'
+});
+
+const dbPoolIdle = new promClient.Gauge({
+  name: 'db_pool_connections_idle',
+  help: 'Number of idle connections in the pool'
+});
+
+const dbPoolWaiting = new promClient.Gauge({
+  name: 'db_pool_clients_waiting',
+  help: 'Number of clients waiting for a connection'
+});
+
+// Connection error counter
+const dbConnectionErrors = new promClient.Counter({
+  name: 'db_connection_errors_total',
+  help: 'Total number of database connection errors'
+});
+
+// Slow query counter
+const dbSlowQueries = new promClient.Counter({
+  name: 'db_slow_queries_total',
+  help: 'Total number of slow queries detected'
+});
+
+// Export metrics registry for /metrics endpoint
+export const dbMetrics = {
+  queryDuration: dbQueryDuration,
+  queryTotal: dbQueryTotal,
+  poolTotal: dbPoolTotal,
+  poolIdle: dbPoolIdle,
+  poolWaiting: dbPoolWaiting,
+  connectionErrors: dbConnectionErrors,
+  slowQueries: dbSlowQueries
+};
 
 // Database configuration from environment
 const dbConfig: PoolConfig = {
@@ -70,12 +124,12 @@ let pool: Pool | null = null;
  */
 export async function initDb(): Promise<void> {
   if (pool) {
-    logger.info('Database pool already initialized');
+    secureLog('info', 'Database pool already initialized');
     return;
   }
 
   try {
-    logger.info(`Initializing PostgreSQL connection pool...`, {
+    secureLog('info', `Initializing PostgreSQL connection pool...`, {
       host: dbConfig.host,
       port: dbConfig.port,
       database: dbConfig.database,
@@ -102,16 +156,17 @@ export async function initDb(): Promise<void> {
 
     pool.on('error', (err, client) => {
       stats.connectionErrors++;
-      logger.error('Unexpected error on idle client:', err.message);
+      dbConnectionErrors.inc();
+      secureLog('error', 'Unexpected error on idle client:', err.message);
     });
 
     // Test the connection
     const testResult = await pool.query('SELECT NOW() as current_time');
-    logger.info('Database connection pool initialized successfully', {
+    secureLog('info', 'Database connection pool initialized successfully', {
       serverTime: testResult.rows[0]?.current_time
     });
   } catch (error: any) {
-    logger.error('Failed to initialize database pool:', error.message);
+    secureLog('error', 'Failed to initialize database pool:', error.message);
     pool = null;
     throw error;
   }
@@ -136,14 +191,21 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
     const timeMs = Number(timeNs) / 1_000_000;
+    const timeSec = timeMs / 1000;
 
     stats.successfulQueries++;
     stats.totalQueryTimeNs += timeNs;
 
+    // Record Prometheus metrics
+    dbQueryDuration.observe({ status: 'success' }, timeSec);
+    dbQueryTotal.inc({ status: 'success' });
+
     // Log slow queries
     if (timeMs > SLOW_QUERY_THRESHOLD_MS) {
       stats.slowQueries++;
-      logger.warn('Slow query detected', {
+      dbSlowQueries.inc();
+      dbQueryTotal.inc({ status: 'slow' });
+      secureLog('warn', 'Slow query detected', {
         query: text.substring(0, 100),
         timeMs: timeMs.toFixed(3),
         threshold: SLOW_QUERY_THRESHOLD_MS,
@@ -156,9 +218,15 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
     const endTime = process.hrtime.bigint();
     const timeNs = endTime - startTime;
     const timeMs = Number(timeNs) / 1_000_000;
+    const timeSec = timeMs / 1000;
 
     stats.failedQueries++;
-    logger.error('Database query error:', {
+    
+    // Record Prometheus error metrics
+    dbQueryDuration.observe({ status: 'error' }, timeSec);
+    dbQueryTotal.inc({ status: 'error' });
+    
+    secureLog('error', 'Database query error:', {
       error: error.message,
       query: text.substring(0, 100),
       timeMs: timeMs.toFixed(3)
@@ -207,7 +275,7 @@ export async function queryWithCache<T extends QueryResultRow = QueryResultRow>(
   
   // Store in cache (don't await - fire and forget)
   redisService.set(cacheKey, JSON.stringify(dbResult.result.rows), cacheTtlSeconds)
-    .catch(err => logger.error('Failed to cache query result:', err.message));
+    .catch(err => secureLog('error', 'Failed to cache query result:', err.message));
 
   const totalEndTime = process.hrtime.bigint();
   return {
@@ -245,6 +313,15 @@ export async function isHealthy(): Promise<boolean> {
 }
 
 /**
+ * Update Prometheus pool gauges with current values
+ */
+export function updatePoolMetrics(): void {
+  dbPoolTotal.set(pool?.totalCount ?? 0);
+  dbPoolIdle.set(pool?.idleCount ?? 0);
+  dbPoolWaiting.set(pool?.waitingCount ?? 0);
+}
+
+/**
  * Get pool and query statistics
  */
 export function getStats(): {
@@ -259,6 +336,9 @@ export function getStats(): {
   connectionAcquires: number;
   connectionErrors: number;
 } {
+  // Update Prometheus gauges when stats are retrieved
+  updatePoolMetrics();
+  
   const avgQueryTimeMs = stats.totalQueries > 0
     ? (Number(stats.totalQueryTimeNs / BigInt(stats.totalQueries)) / 1_000_000).toFixed(3)
     : '0.000';
@@ -282,10 +362,10 @@ export function getStats(): {
  */
 export async function closeDb(): Promise<void> {
   if (pool) {
-    logger.info('Closing database connection pool...');
+    secureLog('info', 'Closing database connection pool...');
     await pool.end();
     pool = null;
-    logger.info('Database connection pool closed');
+    secureLog('info', 'Database connection pool closed');
   }
 }
 
@@ -296,6 +376,8 @@ export default {
   getClient,
   isHealthy,
   getStats,
-  closeDb
+  updatePoolMetrics,
+  closeDb,
+  dbMetrics
 };
 

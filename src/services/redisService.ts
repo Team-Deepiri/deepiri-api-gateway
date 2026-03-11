@@ -9,13 +9,7 @@
  */
 
 import { createClient, RedisClientType } from 'redis';
-import winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
-});
+import { secureLog } from '@deepiri/shared-utils';
 
 // Redis client configuration
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
@@ -56,54 +50,54 @@ let isConnected = false;
  */
 export async function initRedis(): Promise<void> {
   if (client && isConnected) {
-    logger.info('Redis already connected');
+    secureLog('info', 'Redis already connected');
     return;
   }
 
   try {
-    logger.info(`Connecting to Redis at ${REDIS_URL}...`);
+    secureLog('info', `Connecting to Redis at ${REDIS_URL}...`);
     
     client = createClient({
       url: REDIS_URL,
       socket: {
         reconnectStrategy: (retries) => {
           if (retries > 10) {
-            logger.error('Redis max reconnection attempts reached');
+            secureLog('error', 'Redis max reconnection attempts reached');
             return new Error('Redis max reconnection attempts');
           }
           const delay = Math.min(retries * 100, 3000);
-          logger.warn(`Redis reconnecting in ${delay}ms (attempt ${retries})`);
+          secureLog('warn', `Redis reconnecting in ${delay}ms (attempt ${retries})`);
           return delay;
         }
       }
     });
 
     client.on('error', (err) => {
-      logger.error('Redis Client Error:', err.message);
+      secureLog('error', 'Redis Client Error:', err.message);
       stats.errors++;
       isConnected = false;
     });
 
     client.on('connect', () => {
-      logger.info('Redis connected');
+      secureLog('info', 'Redis connected');
       isConnected = true;
     });
 
     client.on('ready', () => {
-      logger.info('Redis ready');
+      secureLog('info', 'Redis ready');
       isConnected = true;
     });
 
     client.on('reconnecting', () => {
-      logger.warn('Redis reconnecting...');
+      secureLog('warn', 'Redis reconnecting...');
       isConnected = false;
     });
 
     await client.connect();
     isConnected = true;
-    logger.info('Redis connection established successfully');
+    secureLog('info', 'Redis connection established successfully');
   } catch (error: any) {
-    logger.error('Failed to connect to Redis:', error.message);
+    secureLog('error', 'Failed to connect to Redis:', error.message);
     stats.errors++;
     isConnected = false;
     throw error;
@@ -137,7 +131,7 @@ export async function get(key: string): Promise<{ value: string | null; timeNs: 
     return { value, timeNs };
   } catch (error: any) {
     const endTime = process.hrtime.bigint();
-    logger.error(`Redis GET error for key ${key}:`, error.message);
+    secureLog('error', `Redis GET error for key ${key}:`, error.message);
     stats.errors++;
     stats.misses++;
     return { value: null, timeNs: endTime - startTime };
@@ -170,7 +164,7 @@ export async function set(
     return { success: true, timeNs };
   } catch (error: any) {
     const endTime = process.hrtime.bigint();
-    logger.error(`Redis SET error for key ${key}:`, error.message);
+    secureLog('error', `Redis SET error for key ${key}:`, error.message);
     stats.errors++;
     return { success: false, timeNs: endTime - startTime };
   }
@@ -189,7 +183,7 @@ export async function del(key: string): Promise<boolean> {
     stats.deletes++;
     return true;
   } catch (error: any) {
-    logger.error(`Redis DEL error for key ${key}:`, error.message);
+    secureLog('error', `Redis DEL error for key ${key}:`, error.message);
     stats.errors++;
     return false;
   }
@@ -254,11 +248,11 @@ export function getStats(): {
  */
 export async function closeRedis(): Promise<void> {
   if (client) {
-    logger.info('Closing Redis connection...');
+    secureLog('info', 'Closing Redis connection...');
     await client.quit();
     client = null;
     isConnected = false;
-    logger.info('Redis connection closed');
+    secureLog('info', 'Redis connection closed');
   }
 }
 
