@@ -15,6 +15,31 @@ currently being supported with security updates.
 ## Reporting a Vulnerability
 
 ### Advisory Reference
+Dependabot Alert #5
+Package: qs (npm)
+Affected Versions: >= 6.7.0, <= 6.14.1
+Patched Version: 6.14.2
+
+### Summary
+
+The `arrayLimit` option in qs does not enforce limits for comma-separated
+values when `comma: true` is enabled. This allows a denial of service (DoS)
+via memory exhaustion by creating very large arrays from a single query
+parameter (e.g., `?param=,,,,,,,,`).
+
+This occurs because the comma parsing logic performs `split(',')` before
+the `arrayLimit` or `throwOnLimitExceeded` checks are evaluated, allowing
+attackers to bypass intended array size restrictions.
+
+This behavior only occurs when the `comma: true` option is explicitly enabled,
+as it is not the default configuration.
+
+### Resolution
+
+1. Upgrade qs to version 6.14.2 or later.
+2. Regenerate and commit updated lockfiles.
+3. Confirm applications do not enable `comma: true` unnecessarily.
+4. If `comma: true` is required, enforce strict request and parameter limits.
 Dependabot Alert #10  
 Package: minimatch (npm)  
 Affected Versions: < 3.1.3  
