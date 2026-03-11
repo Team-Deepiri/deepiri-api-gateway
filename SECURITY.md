@@ -40,6 +40,55 @@ Applications using the `jws.verify()` interface, including those using
 3. Review authentication and token verification logic to ensure safe handling
    of user-supplied data.
 4. Confirm CI validation before closing the alert.
+Dependabot Alert #5
+Package: qs (npm)
+Affected Versions: >= 6.7.0, <= 6.14.1
+Patched Version: 6.14.2
+
+### Summary
+
+The `arrayLimit` option in qs does not enforce limits for comma-separated
+values when `comma: true` is enabled. This allows a denial of service (DoS)
+via memory exhaustion by creating very large arrays from a single query
+parameter (e.g., `?param=,,,,,,,,`).
+
+This occurs because the comma parsing logic performs `split(',')` before
+the `arrayLimit` or `throwOnLimitExceeded` checks are evaluated, allowing
+attackers to bypass intended array size restrictions.
+
+This behavior only occurs when the `comma: true` option is explicitly enabled,
+as it is not the default configuration.
+
+### Resolution
+
+1. Upgrade qs to version 6.14.2 or later.
+2. Regenerate and commit updated lockfiles.
+3. Confirm applications do not enable `comma: true` unnecessarily.
+4. If `comma: true` is required, enforce strict request and parameter limits.
+Dependabot Alert #10  
+Package: minimatch (npm)  
+Affected Versions: < 3.1.3  
+Patched Version: 3.1.3  
+
+### Summary
+
+The `minimatch` package contains a Regular Expression Denial of Service (ReDoS)
+vulnerability caused by unbounded recursive backtracking in the `matchOne()`
+function when evaluating glob patterns containing multiple non-adjacent
+`**` (GLOBSTAR) segments.
+
+When a crafted pattern with many globstar segments is evaluated against a
+non-matching path, the function explores a combinatorial number of recursive
+calls. This leads to exponential runtime complexity and can stall the Node.js
+event loop for several seconds per invocation.
+
+### Resolution
+
+1. Upgrade `minimatch` to version **3.1.3 or later**.
+2. Regenerate and commit updated dependency lockfiles.
+3. Avoid evaluating attacker-controlled glob patterns.
+4. Implement validation or restrictions on glob patterns accepted from user input.
+5. Confirm CI validation before closing the alert.
 
 ### Response Expectations
 
