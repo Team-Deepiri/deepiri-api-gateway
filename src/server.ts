@@ -5,7 +5,8 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { logger } from '@deepiri/shared-utils';
+import { secureLog, createLogger } from '@deepiri/shared-utils';
+import { bodyParserConfig, requestSizeLimiter } from './middleware/requestLimits';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';
 
@@ -49,8 +50,11 @@ interface ExtendedProxyOptions extends Options {
 dotenv.config();
 
 const app: Express = express();
+
+export type { Request, Response, NextFunction } from 'express';
 const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
+const logger = createLogger('api-gateway');
 
 interface ServiceUrls {
   auth: string;
@@ -162,6 +166,7 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
 // Validate on startup
 validateServiceUrls();
 
+app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
@@ -221,6 +226,17 @@ initializeServices();
 
 // Health check needs to come BEFORE proxy routes
 app.set("trust proxy", 1);
+app.get('/health', async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
+  
+  res.json({ 
+    status: 'healthy', 
+    service: 'api-gateway',
+    redis: redisHealthy ? 'healthy' : 'unhealthy',
+    database: dbHealthy ? 'healthy' : 'unhealthy'
+  });
+});
 
 type BucketSpec = { capacity: number; refillRate: number };
 
@@ -594,17 +610,35 @@ app.use((req, res, next) => {
   next();
 });
 
-// Don't parse JSON bodies globally - let http-proxy-middleware handle it
+// Apply request size limiter globally (safe for proxied routes; uses Content-Length only)
+app.use(requestSizeLimiter);
+
+// Don't parse JSON/urlencoded bodies globally - let http-proxy-middleware handle it
 // This preserves the request stream for proper proxying
-// Only parse for non-proxy routes like /health
+// Only parse for non-proxy routes like /health and /test endpoints
 app.use((req, res, next) => {
   try {
     // Skip body parsing for API proxy routes - let the proxy handle streaming
     if (req.path.startsWith('/api/')) {
       return next();
     }
-    // Parse body only for non-proxy routes (like /health)
-    express.json({ limit: '10mb', strict: false })(req, res, next);
+
+    // Parse body only for non-proxy routes with strict size limits
+    express.json(bodyParserConfig.json)(req, res, (err) => {
+      if (err) {
+        secureLog('error', 'JSON body parsing error:', err);
+        return next(err);
+      }
+
+      express.urlencoded(bodyParserConfig.urlencoded)(req, res, (urlErr) => {
+        if (urlErr) {
+          secureLog('error', 'URL-encoded body parsing error:', urlErr);
+          return next(urlErr);
+        }
+
+        next();
+      });
+    });
   } catch (error) {
     logger.error( 'Body parsing error:', error);
     next(error);

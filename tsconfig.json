@@ -19,7 +19,6 @@
       "@deepiri/shared-utils/*": ["../../shared/deepiri-shared-utils/src/*"]
     }
   },
-  
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.jsx", "**/*.tsx"],
   "ts-node": {
