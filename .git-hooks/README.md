@@ -33,37 +33,7 @@ git config core.hooksPath .git-hooks
   - Allowed: `dev`, `name-dev`, `dev-something`, `my-dev-branch`
 - **post-checkout**: Automatically configures hooksPath on checkout (if not already set)
 - **post-merge**: Automatically syncs hooks to submodules on pull
-
-## Testing
-
-Try pushing to a protected branch - you should see an error:
-```bash
-git checkout main
-git push origin main
-# ❌ ERROR: You cannot push directly to 'main'.
-
-git checkout master
-git push origin master
-# ❌ ERROR: You cannot push directly to 'master'.
-```
-
-These branches are allowed:
-```bash
-git checkout name-dev
-git push origin name-dev
-# ✅ Allowed (dev with dash prefix)
-
-git checkout dev
-git push origin dev
-# ✅ Allowed
-
-git checkout my-team-dev
-git push origin my-team-dev
-# ✅ Allowed
-
-git checkout dev-something
-git push origin dev-something
-# ✅ Allowed (dev with dash suffix)
+suffix)
 ```
 
 This confirms hooks are working!
