@@ -13,7 +13,11 @@
     "declaration": true,
     "sourceMap": true,
     "moduleResolution": "node",
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepiri/shared-utils/*": ["../../shared/deepiri-shared-utils/src/*"]
+    }
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.jsx", "**/*.tsx"],
@@ -22,6 +26,7 @@
       "module": "commonjs"
     },
     "transpileOnly": true,
-    "files": true
+    "files": true,
+    "require": ["tsconfig-paths/register"]
   }
 }
