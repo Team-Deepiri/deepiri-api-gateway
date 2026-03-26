@@ -1,0 +1,63 @@
+name: Deepiri CI - deepiri-api-gateway
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Typecheck, Test, Build & Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test -- --passWithNoTests
+
+      - name: Build
+        run: npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./platform-services
+          file: ./platform-services/backend/deepiri-api-gateway/Dockerfile
+          push: false
+          tags: deepiri-api-gateway:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify container runs
+        run: |
+          docker run -d --name test-gateway deepiri-api-gateway:ci
+          sleep 8
+          docker ps -a
+          docker logs test-gateway
+          docker inspect -f '{{.State.Running}}' test-gateway | grep -q true
+          docker stop test-gateway
