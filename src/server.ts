@@ -15,6 +15,7 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import {
   validateBody,
   validateHeaders,
@@ -98,7 +99,7 @@ const validateServiceUrls = () => {
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
-  secureLog('info', 'Environment variables check:', {
+  logger.info( 'Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
     TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
     ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
@@ -116,7 +117,7 @@ const validateServiceUrls = () => {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      secureLog('error', `Service URL missing for ${service}:`, {
+      logger.error( `Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
@@ -126,12 +127,12 @@ const validateServiceUrls = () => {
   }
 
   if (missingServices.length > 0) {
-    secureLog('error', 'Missing or empty service URLs:', missingServices);
-    secureLog('error', 'Current SERVICES configuration:', SERVICES);
+    logger.error( 'Missing or empty service URLs:', missingServices);
+    logger.error( 'Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
 
-  secureLog('info', 'All service URLs validated successfully:', SERVICES);
+  logger.info( 'All service URLs validated successfully:', SERVICES);
 };
 
 // Helper to get environment variable name
@@ -212,19 +213,19 @@ app.use((req: Request, res: Response, next) => {
 // Initialize Redis and DB connection pools
 async function initializeServices() {
   try {
-    secureLog('info', 'Initializing Redis connection pool...');
+    logger.info( 'Initializing Redis connection pool...');
     await redisService.initRedis();
-    secureLog('info', 'Redis connection pool ready');
+    logger.info( 'Redis connection pool ready');
   } catch (error: any) {
-    secureLog('warn', 'Redis initialization failed (will retry on first use):', error.message);
+    logger.warn( 'Redis initialization failed (will retry on first use):', error.message);
   }
 
   try {
-    secureLog('info', 'Initializing PostgreSQL connection pool...');
+    logger.info( 'Initializing PostgreSQL connection pool...');
     await dbService.initDb();
-    secureLog('info', 'PostgreSQL connection pool ready');
+    logger.info( 'PostgreSQL connection pool ready');
   } catch (error: any) {
-    secureLog('warn', 'PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn( 'PostgreSQL initialization failed (will retry on first use):', error.message);
   }
 }
 
@@ -232,6 +233,7 @@ async function initializeServices() {
 initializeServices();
 
 // Health check needs to come BEFORE proxy routes
+app.set("trust proxy", 1);
 app.get('/health', async (req: Request, res: Response) => {
   const [redisHealthy, dbHealthy] = await Promise.all([
     redisService.isHealthy(),
@@ -528,6 +530,26 @@ if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== '
   });
 }
 
+app.get("/health", async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
+  res.json({
+    status: "healthy",
+    service: "api-gateway",
+    services: Object.keys(SERVICES),
+    connections: {
+      redis: redisHealthy ? 'connected' : 'disconnected',
+      database: dbHealthy ? 'connected' : 'disconnected'
+    },
+    timestamp: new Date().toISOString(),
+    throttling: {
+      globalTokens: globalTokenBucket.getTokens(),
+      authTokens: authTokenBucket.getTokens(),
+      queueLength: requestQueue.getQueueLength(),
+    },
+  });
+});
+
 app.get("/api/throttling/status", (req: Request, res: Response) => {
   const services = Object.fromEntries(
     Object.entries(serviceBuckets).map(([service, bucket]) => [
@@ -569,7 +591,7 @@ app.get('/metrics', async (req: Request, res: Response) => {
     res.set('Content-Type', promClient.register.contentType);
     res.end(await promClient.register.metrics());
   } catch (error: any) {
-    secureLog('error', 'Error generating metrics:', error.message);
+    logger.error( 'Error generating metrics:', error.message);
     res.status(500).end(error.message);
   }
 });
@@ -592,7 +614,7 @@ app.post(
 // Log all incoming requests BEFORE body parsing
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
-    secureLog('info', `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
+    logger.info( `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
       headers: {
         'content-type': req.get('content-type'),
         'content-length': req.get('content-length'),
@@ -634,7 +656,7 @@ app.use((req, res, next) => {
       });
     });
   } catch (error) {
-    secureLog('error', 'Body parsing error:', error);
+    logger.error( 'Body parsing error:', error);
     next(error);
   }
 });
@@ -659,22 +681,22 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const contentType = req.get('content-type') || 'unknown';
         const contentLength = req.get('content-length') || 'unknown';
-        secureLog('info', `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
+        logger.info( `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
           contentType,
           contentLength,
           hasBody: !!req.body
         });
       }
     } catch (error) {
-      secureLog('error', 'Error in onProxyReq:', error);
+      logger.error( 'Error in onProxyReq:', error);
     }
   },
   onProxyRes: (proxyRes: any, req: any, res: any) => {
     // Log response but don't modify CORS headers - let backend service handle them
-    secureLog('info', `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
+    logger.info( `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    secureLog('error', 'Proxy error:', {
+    logger.error( 'Proxy error:', {
       error: err.message,
       target,
       path: req.originalUrl || req.path,
@@ -702,7 +724,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
   const rewrittenPath = req.path.replace(/^\//, '/auth/');
   const contentType = req.get('content-type') || 'unknown';
   const contentLength = req.get('content-length') || 'unknown';
-  secureLog('info', `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+  logger.info( `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
     contentType,
     contentLength,
     headers: {
@@ -718,7 +740,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
 };
 authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
   // Log the response
-  secureLog('info', `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+  logger.info( `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
     statusCode: proxyRes.statusCode,
     headers: {
       'content-type': proxyRes.headers['content-type'],
@@ -731,7 +753,7 @@ authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
   // Don't overwrite them - let the auth service's CORS middleware handle it
   // But log if they're missing
   if (!proxyRes.headers['access-control-allow-origin']) {
-    secureLog('warn', `[AUTH] Missing CORS headers in response from auth service`);
+    logger.warn( `[AUTH] Missing CORS headers in response from auth service`);
   }
 
   // Call original handler if it exists
@@ -751,10 +773,10 @@ app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': 
 app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
 app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
-
+app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  secureLog('error', 'Proxy error:', {
+  logger.error( 'Proxy error:', {
     error: err.message,
     stack: err.stack,
     path: req.path,
@@ -1047,7 +1069,7 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
 
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
-  secureLog('warn', `Unhandled route: ${req.method} ${req.path}`);
+  logger.warn( `Unhandled route: ${req.method} ${req.path}`);
   res.status(404).json({
     error: 'Not found',
     path: req.path,
@@ -1057,12 +1079,12 @@ app.use((req: Request, res: Response) => {
 
 // Add unhandled error handlers
 process.on('uncaughtException', (error) => {
-  secureLog('error', 'Uncaught Exception:', error);
+  logger.error( 'Uncaught Exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  secureLog('error', 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
+  logger.error( 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
 });
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
@@ -1071,7 +1093,7 @@ process.on('unhandledRejection', (reason, promise) => {
 let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-secureLog('info', 'Checking realtime service URL:', {
+logger.info( 'Checking realtime service URL:', {
   url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
@@ -1082,29 +1104,29 @@ secureLog('info', 'Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    secureLog('info', `Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    logger.info( `Initializing Socket.IO proxy to: ${realtimeUrl}`);
     socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
       onProxyReqWs: (_proxyReq: any, req: any) => {
-        secureLog('info', `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+        logger.info( `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
       },
       onError: (err: Error, req: express.Request, res: express.Response) => {
-        secureLog('error', 'Socket.IO proxy error:', err.message);
+        logger.error( 'Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
     } as any);
-    secureLog('info', 'Socket.IO proxy initialized successfully');
+    logger.info( 'Socket.IO proxy initialized successfully');
   } catch (error: any) {
-    secureLog('error', 'Failed to create Socket.IO proxy:', error.message);
+    logger.error( 'Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
   }
 } else {
-  secureLog('warn', 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
+  logger.warn( 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
     realtimeUrl,
     envVar: process.env.REALTIME_GATEWAY_URL
   });
@@ -1117,7 +1139,7 @@ if (socketIoProxy) {
   // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      secureLog('info', `WebSocket upgrade request: ${req.url}`);
+      logger.info( `WebSocket upgrade request: ${req.url}`);
       (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
@@ -1127,7 +1149,7 @@ if (socketIoProxy) {
   // If Socket.IO proxy is not configured, handle WebSocket requests gracefully
   httpServer.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      secureLog('warn', 'WebSocket upgrade requested but realtime service not configured');
+      logger.warn( 'WebSocket upgrade requested but realtime service not configured');
       socket.destroy();
     } else {
       socket.destroy();
@@ -1136,13 +1158,13 @@ if (socketIoProxy) {
 }
 
 httpServer.listen(PORT, () => {
-  secureLog('info', `API Gateway running on port ${PORT}`);
-  secureLog('info', 'Proxying to services:', SERVICES);
-  secureLog('info', 'WebSocket support enabled for Socket.IO -> realtime gateway');
+  logger.info( `API Gateway running on port ${PORT}`);
+  logger.info( 'Proxying to services:', SERVICES);
+  logger.info( 'WebSocket support enabled for Socket.IO -> realtime gateway');
 }).on('error', (error: any) => {
-  secureLog('error', 'Server error:', error);
+  logger.error( 'Server error:', error);
   if (error.code === 'EADDRINUSE') {
-    secureLog('error', `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
+    logger.error( `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
     process.exit(1);
   }
 });
