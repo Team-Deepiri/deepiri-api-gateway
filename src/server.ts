@@ -5,8 +5,10 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog } from '@deepiri/shared-utils';
+import { secureLog, createLogger } from '@deepiri/shared-utils';
+import { bodyParserConfig, requestSizeLimiter } from './middleware/requestLimits';
 import promClient from 'prom-client';
+import rateLimit from 'express-rate-limit';
 
 // Import our new services for connection pooling
 import * as redisService from './services/redisService';
@@ -14,6 +16,7 @@ import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import winston from 'winston';
+import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 
 // ============================================================================
 // PROMETHEUS METRICS SETUP
@@ -48,8 +51,11 @@ interface ExtendedProxyOptions extends Options {
 dotenv.config();
 
 const app: Express = express();
+
+export type { Request, Response, NextFunction } from 'express';
 const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
+const logger = createLogger('api-gateway');
 
 const logger = winston.createLogger({
   level: 'info',
@@ -91,7 +97,7 @@ const validateServiceUrls = () => {
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
-  secureLog('info', 'Environment variables check:', {
+  logger.info( 'Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
     TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
     ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
@@ -109,7 +115,7 @@ const validateServiceUrls = () => {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      secureLog('error', `Service URL missing for ${service}:`, {
+      logger.error( `Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
@@ -119,12 +125,12 @@ const validateServiceUrls = () => {
   }
 
   if (missingServices.length > 0) {
-    secureLog('error', 'Missing or empty service URLs:', missingServices);
-    secureLog('error', 'Current SERVICES configuration:', SERVICES);
+    logger.error( 'Missing or empty service URLs:', missingServices);
+    logger.error( 'Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
 
-  secureLog('info', 'All service URLs validated successfully:', SERVICES);
+  logger.info( 'All service URLs validated successfully:', SERVICES);
 };
 
 // Helper to get environment variable name
@@ -166,6 +172,7 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
 // Validate on startup
 validateServiceUrls();
 
+app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
@@ -204,19 +211,19 @@ app.use((req: Request, res: Response, next) => {
 // Initialize Redis and DB connection pools
 async function initializeServices() {
   try {
-    secureLog('info', 'Initializing Redis connection pool...');
+    logger.info( 'Initializing Redis connection pool...');
     await redisService.initRedis();
-    secureLog('info', 'Redis connection pool ready');
+    logger.info( 'Redis connection pool ready');
   } catch (error: any) {
-    secureLog('warn', 'Redis initialization failed (will retry on first use):', error.message);
+    logger.warn( 'Redis initialization failed (will retry on first use):', error.message);
   }
 
   try {
-    secureLog('info', 'Initializing PostgreSQL connection pool...');
+    logger.info( 'Initializing PostgreSQL connection pool...');
     await dbService.initDb();
-    secureLog('info', 'PostgreSQL connection pool ready');
+    logger.info( 'PostgreSQL connection pool ready');
   } catch (error: any) {
-    secureLog('warn', 'PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn( 'PostgreSQL initialization failed (will retry on first use):', error.message);
   }
 }
 
@@ -224,6 +231,7 @@ async function initializeServices() {
 initializeServices();
 
 // Health check needs to come BEFORE proxy routes
+app.set("trust proxy", 1);
 app.get('/health', async (req: Request, res: Response) => {
   const redisHealthy = await redisService.isHealthy();
   const dbHealthy = await dbService.isHealthy();
@@ -231,12 +239,340 @@ app.get('/health', async (req: Request, res: Response) => {
   res.json({ 
     status: 'healthy', 
     service: 'api-gateway',
+    redis: redisHealthy ? 'healthy' : 'unhealthy',
+    database: dbHealthy ? 'healthy' : 'unhealthy'
+  });
+});
+
+type BucketSpec = { capacity: number; refillRate: number };
+
+class TokenBucket {
+  private tokens: number;
+  private lastRefill: number;
+  private readonly capacity: number;
+  private readonly refillRate: number; // tokens per ms
+
+  constructor(capacity: number, refillRatePerSecond: number) {
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.refillRate = refillRatePerSecond / 1000;
+    this.lastRefill = Date.now();
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const tokensToAdd = (now - this.lastRefill) * this.refillRate;
+    this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+
+  consume(tokens = 1): boolean {
+    this.refill();
+    if (this.tokens >= tokens) {
+      this.tokens -= tokens;
+      return true;
+    }
+    return false;
+  }
+
+  getTokens(): number {
+    this.refill();
+    return this.tokens;
+  }
+
+  getCapacity(): number {
+    return this.capacity;
+  }
+
+  getRefillRatePerSecond(): number {
+    return this.refillRate * 1000;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+class RequestQueue {
+  private queue: Array<{
+    req: Request;
+    res: Response;
+    next: Function;
+    bucket: TokenBucket;
+    bucketName: string;
+    enqueuedAt: number;
+  }> = [];
+  private processing = false;
+
+  constructor(
+    private readonly maxQueueSize = 100,
+    private readonly processDelay = 100,
+    private readonly maxWaitMs = 10_000
+  ) {}
+
+  enqueue(
+    req: Request,
+    res: Response,
+    next: Function,
+    bucket: TokenBucket,
+    bucketName: string
+  ): boolean {
+    if (this.queue.length >= this.maxQueueSize) return false;
+
+    const item = { req, res, next, bucket, bucketName, enqueuedAt: Date.now() };
+    this.queue.push(item);
+
+    res.once("close", () => {
+      const i = this.queue.indexOf(item);
+      if (i !== -1) this.queue.splice(i, 1);
+    });
+
+    void this.processQueue();
+    return true;
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
+      while (this.queue.length > 0) {
+        const now = Date.now();
+
+        // drop all timed-out requests (anywhere in the queue)
+        if (this.queue.length > 0) {
+          const stillValid: typeof this.queue = [];
+
+          for (const item of this.queue) {
+            if (now - item.enqueuedAt > this.maxWaitMs) {
+              if (!item.res.headersSent && !item.res.writableEnded) {
+                item.res.status(429).json({
+                  error: "Service temporarily overloaded",
+                  message: "Request timed out in queue. Please try again later.",
+                });
+              }
+              continue;
+            }
+            stillValid.push(item);
+          }
+
+          this.queue = stillValid;
+        }
+
+        // drop requests whose client disconnected
+        this.queue = this.queue.filter((it) => !it.res.writableEnded);
+
+        if (this.queue.length === 0) break;
+
+        // pick first request whose bucket can consume a token
+        const idx = this.queue.findIndex((it) => it.bucket.consume(1));
+        if (idx === -1) {
+          await sleep(this.processDelay);
+          continue;
+        }
+
+        const item = this.queue.splice(idx, 1)[0];
+
+        // if client already gone, skip
+        if (item.res.writableEnded) {
+          await sleep(this.processDelay);
+          continue;
+        }
+
+        item.next();
+        await sleep(this.processDelay);
+      }
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+}
+
+const intEnv = (val: string | undefined, fallback: number) => {
+  const n = Number.parseInt(val ?? "", 10);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const THROTTLING_CONFIG = {
+  global: {
+    capacity: intEnv(process.env.GLOBAL_TOKEN_CAPACITY, 50),
+    refillRate: intEnv(process.env.GLOBAL_REFILL_RATE, 10),
+  },
+  auth: {
+    capacity: intEnv(process.env.AUTH_TOKEN_CAPACITY, 20),
+    refillRate: intEnv(process.env.AUTH_REFILL_RATE, 2),
+  },
+  queue: {
+    maxSize: intEnv(process.env.MAX_QUEUE_SIZE, 50),
+    processDelay: intEnv(process.env.QUEUE_PROCESS_DELAY, 200),
+    maxWaitMs: intEnv(process.env.MAX_QUEUE_WAIT_MS, 10_000),
+  },
+};
+
+const globalTokenBucket = new TokenBucket(THROTTLING_CONFIG.global.capacity, THROTTLING_CONFIG.global.refillRate);
+const authTokenBucket = new TokenBucket(THROTTLING_CONFIG.auth.capacity, THROTTLING_CONFIG.auth.refillRate);
+const requestQueue = new RequestQueue(THROTTLING_CONFIG.queue.maxSize, THROTTLING_CONFIG.queue.processDelay, THROTTLING_CONFIG.queue.maxWaitMs);
+
+const SERVICE_SPECS: Record<string, BucketSpec> = {
+  task: { capacity: 30, refillRate: 5 },
+  analytics: { capacity: 25, refillRate: 3 },
+  realtime: { capacity: 40, refillRate: 8 },
+  notification: { capacity: 35, refillRate: 6 },
+  integration: { capacity: 20, refillRate: 2 },
+  challenge: { capacity: 25, refillRate: 4 },
+  engagement: { capacity: 30, refillRate: 5 },
+  cyrex: { capacity: 15, refillRate: 1 },
+};
+
+const serviceBuckets: Record<string, TokenBucket> = Object.fromEntries(
+  Object.entries(SERVICE_SPECS).map(([name, spec]) => [name, new TokenBucket(spec.capacity, spec.refillRate)])
+) as Record<string, TokenBucket>;
+
+const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
+  { prefix: "/api/auth", name: "auth", bucket: authTokenBucket },
+  { prefix: "/api/tasks", name: "task", bucket: serviceBuckets.task },
+  { prefix: "/api/analytics", name: "analytics", bucket: serviceBuckets.analytics },
+  { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
+  { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
+  { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
+  { prefix: "/api/challenges", name: "challenge", bucket: serviceBuckets.challenge },
+  { prefix: "/api/gamification", name: "engagement", bucket: serviceBuckets.engagement },
+  { prefix: "/api/agent", name: "cyrex", bucket: serviceBuckets.cyrex },
+];
+
+const getFullPath = (req: Request) => `${req.baseUrl}${req.path}`;
+const pickBucket = (fullPath: string) => ROUTES.find((r) => fullPath.startsWith(r.prefix));
+
+const throttlingMiddleware = (req: Request, res: Response, next: Function) => {
+  if (req.method === "OPTIONS") return next();
+
+  const clientIP = req.ip || req.socket.remoteAddress || "unknown";
+  const fullPath = getFullPath(req);
+
+  const match = pickBucket(fullPath);
+  const bucket = match?.bucket ?? globalTokenBucket;
+  const bucketName = match?.name ?? "global";
+
+  // Set rate limit headers
+  res.set('RateLimit-Limit', bucket.getCapacity().toString());
+  res.set('RateLimit-Remaining', Math.floor(bucket.getTokens()).toString());
+  res.set('RateLimit-Reset', Math.floor((Date.now() + 1000) / 1000).toString()); // Approximate next second
+
+  if (bucket.consume(1)) {
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.info(`[THROTTLE] Request allowed - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Tokens left: ${bucket.getTokens()}`);
+    }
+    return next();
+  }
+
+  const queued = requestQueue.enqueue(req, res, next, bucket, bucketName);
+  if (queued) {
+    if (process.env.RATE_LIMIT_DEBUG === '1') {
+      logger.warn(`[THROTTLE] Request queued - IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}, Queue length: ${requestQueue.getQueueLength()}`);
+    }
+    return;
+  }
+
+  if (process.env.RATE_LIMIT_DEBUG === '1') {
+    logger.error(`[THROTTLE] Request rejected - Queue full, IP: ${clientIP}, Path: ${fullPath}, Bucket: ${bucketName}`);
+  }
+  res.status(429).json({
+    error: "Service temporarily overloaded",
+    message: "Too many concurrent requests. Please try again later.",
+    retryAfter: "5",
+  });
+};
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: "Too many requests from this IP, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+  message: { error: "Too many authentication attempts from this IP, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+});
+
+app.use("/api", throttlingMiddleware);
+
+app.use("/api/auth", authLimiter);
+
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return generalLimiter(req, res, next);
+});
+
+// Test endpoint for rate limiting validation (only enabled in non-prod or with flag)
+if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== 'production') {
+  app.get('/api/rl-test', (req: Request, res: Response) => {
+    res.json({ 
+      ok: true, 
+      ts: new Date().toISOString(), 
+      ip: req.ip 
+    });
+  });
+}
+
+app.get("/health", async (req: Request, res: Response) => {
+  const redisHealthy = await redisService.isHealthy();
+  const dbHealthy = await dbService.isHealthy();
+  res.json({
+    status: "healthy",
+    service: "api-gateway",
     services: Object.keys(SERVICES),
     connections: {
       redis: redisHealthy ? 'connected' : 'disconnected',
       database: dbHealthy ? 'connected' : 'disconnected'
     },
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString(),
+    throttling: {
+      globalTokens: globalTokenBucket.getTokens(),
+      authTokens: authTokenBucket.getTokens(),
+      queueLength: requestQueue.getQueueLength(),
+    },
+  });
+});
+
+app.get("/api/throttling/status", (req: Request, res: Response) => {
+  const services = Object.fromEntries(
+    Object.entries(serviceBuckets).map(([service, bucket]) => [
+      service,
+      {
+        tokens: bucket.getTokens(),
+        capacity: bucket.getCapacity(),
+        refillRate: `${bucket.getRefillRatePerSecond()} per second`,
+      },
+    ])
+  );
+
+  res.json({
+    global: {
+      tokens: globalTokenBucket.getTokens(),
+      capacity: globalTokenBucket.getCapacity(),
+      refillRate: `${globalTokenBucket.getRefillRatePerSecond()} per second`,
+    },
+    auth: {
+      tokens: authTokenBucket.getTokens(),
+      capacity: authTokenBucket.getCapacity(),
+      refillRate: `${authTokenBucket.getRefillRatePerSecond()} per second`,
+    },
+    services,
+    queue: {
+      length: requestQueue.getQueueLength(),
+      maxSize: THROTTLING_CONFIG.queue.maxSize,
+    },
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -249,14 +585,14 @@ app.get('/metrics', async (req: Request, res: Response) => {
     res.set('Content-Type', promClient.register.contentType);
     res.end(await promClient.register.metrics());
   } catch (error: any) {
-    secureLog('error', 'Error generating metrics:', error.message);
+    logger.error( 'Error generating metrics:', error.message);
     res.status(500).end(error.message);
   }
 });
 
 // Test endpoint to verify the gateway is working
 app.post('/test', (req: Request, res: Response) => {
-  secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
+  logger.info( 'Test endpoint called', { body: req.body, headers: req.headers });
   res.json({
     status: 'ok',
     message: 'API Gateway is working',
@@ -268,7 +604,7 @@ app.post('/test', (req: Request, res: Response) => {
 // Log all incoming requests BEFORE body parsing
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
-    secureLog('info', `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
+    logger.info( `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
       headers: {
         'content-type': req.get('content-type'),
         'content-length': req.get('content-length'),
@@ -280,19 +616,37 @@ app.use((req, res, next) => {
   next();
 });
 
-// Don't parse JSON bodies globally - let http-proxy-middleware handle it
+// Apply request size limiter globally (safe for proxied routes; uses Content-Length only)
+app.use(requestSizeLimiter);
+
+// Don't parse JSON/urlencoded bodies globally - let http-proxy-middleware handle it
 // This preserves the request stream for proper proxying
-// Only parse for non-proxy routes like /health
+// Only parse for non-proxy routes like /health and /test endpoints
 app.use((req, res, next) => {
   try {
     // Skip body parsing for API proxy routes - let the proxy handle streaming
     if (req.path.startsWith('/api/')) {
       return next();
     }
-    // Parse body only for non-proxy routes (like /health)
-    express.json({ limit: '10mb', strict: false })(req, res, next);
+
+    // Parse body only for non-proxy routes with strict size limits
+    express.json(bodyParserConfig.json)(req, res, (err) => {
+      if (err) {
+        secureLog('error', 'JSON body parsing error:', err);
+        return next(err);
+      }
+
+      express.urlencoded(bodyParserConfig.urlencoded)(req, res, (urlErr) => {
+        if (urlErr) {
+          secureLog('error', 'URL-encoded body parsing error:', urlErr);
+          return next(urlErr);
+        }
+
+        next();
+      });
+    });
   } catch (error) {
-    secureLog('error', 'Body parsing error:', error);
+    logger.error( 'Body parsing error:', error);
     next(error);
   }
 });
@@ -317,22 +671,22 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const contentType = req.get('content-type') || 'unknown';
         const contentLength = req.get('content-length') || 'unknown';
-        secureLog('info', `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
+        logger.info( `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
           contentType,
           contentLength,
           hasBody: !!req.body
         });
       }
     } catch (error) {
-      secureLog('error', 'Error in onProxyReq:', error);
+      logger.error( 'Error in onProxyReq:', error);
     }
   },
   onProxyRes: (proxyRes: any, req: any, res: any) => {
     // Log response but don't modify CORS headers - let backend service handle them
-    secureLog('info', `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
+    logger.info( `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    secureLog('error', 'Proxy error:', {
+    logger.error( 'Proxy error:', {
       error: err.message,
       target,
       path: req.originalUrl || req.path,
@@ -360,7 +714,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
   const rewrittenPath = req.path.replace(/^\//, '/auth/');
   const contentType = req.get('content-type') || 'unknown';
   const contentLength = req.get('content-length') || 'unknown';
-  secureLog('info', `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+  logger.info( `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
     contentType,
     contentLength,
     headers: {
@@ -376,7 +730,7 @@ authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
 };
 authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
   // Log the response
-  secureLog('info', `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+  logger.info( `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
     statusCode: proxyRes.statusCode,
     headers: {
       'content-type': proxyRes.headers['content-type'],
@@ -389,7 +743,7 @@ authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
   // Don't overwrite them - let the auth service's CORS middleware handle it
   // But log if they're missing
   if (!proxyRes.headers['access-control-allow-origin']) {
-    secureLog('warn', `[AUTH] Missing CORS headers in response from auth service`);
+    logger.warn( `[AUTH] Missing CORS headers in response from auth service`);
   }
 
   // Call original handler if it exists
@@ -410,10 +764,10 @@ app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': 
 app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
 app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
-
+app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  secureLog('error', 'Proxy error:', {
+  logger.error( 'Proxy error:', {
     error: err.message,
     stack: err.stack,
     path: req.path,
@@ -683,7 +1037,7 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
 
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
-  secureLog('warn', `Unhandled route: ${req.method} ${req.path}`);
+  logger.warn( `Unhandled route: ${req.method} ${req.path}`);
   res.status(404).json({
     error: 'Not found',
     path: req.path,
@@ -693,12 +1047,12 @@ app.use((req: Request, res: Response) => {
 
 // Add unhandled error handlers
 process.on('uncaughtException', (error) => {
-  secureLog('error', 'Uncaught Exception:', error);
+  logger.error( 'Uncaught Exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  secureLog('error', 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
+  logger.error( 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
 });
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
@@ -707,7 +1061,7 @@ process.on('unhandledRejection', (reason, promise) => {
 let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-secureLog('info', 'Checking realtime service URL:', {
+logger.info( 'Checking realtime service URL:', {
   url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
@@ -718,29 +1072,29 @@ secureLog('info', 'Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    secureLog('info', `Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    logger.info( `Initializing Socket.IO proxy to: ${realtimeUrl}`);
     socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
       onProxyReqWs: (_proxyReq: any, req: any) => {
-        secureLog('info', `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+        logger.info( `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
       },
       onError: (err: Error, req: express.Request, res: express.Response) => {
-        secureLog('error', 'Socket.IO proxy error:', err.message);
+        logger.error( 'Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
     } as any);
-    secureLog('info', 'Socket.IO proxy initialized successfully');
+    logger.info( 'Socket.IO proxy initialized successfully');
   } catch (error: any) {
-    secureLog('error', 'Failed to create Socket.IO proxy:', error.message);
+    logger.error( 'Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
   }
 } else {
-  secureLog('warn', 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
+  logger.warn( 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
     realtimeUrl,
     envVar: process.env.REALTIME_GATEWAY_URL
   });
@@ -753,7 +1107,7 @@ if (socketIoProxy) {
   // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      secureLog('info', `WebSocket upgrade request: ${req.url}`);
+      logger.info( `WebSocket upgrade request: ${req.url}`);
       (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
@@ -763,7 +1117,7 @@ if (socketIoProxy) {
   // If Socket.IO proxy is not configured, handle WebSocket requests gracefully
   httpServer.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      secureLog('warn', 'WebSocket upgrade requested but realtime service not configured');
+      logger.warn( 'WebSocket upgrade requested but realtime service not configured');
       socket.destroy();
     } else {
       socket.destroy();
@@ -772,13 +1126,13 @@ if (socketIoProxy) {
 }
 
 httpServer.listen(PORT, () => {
-  secureLog('info', `API Gateway running on port ${PORT}`);
-  secureLog('info', 'Proxying to services:', SERVICES);
-  secureLog('info', 'WebSocket support enabled for Socket.IO -> realtime gateway');
+  logger.info( `API Gateway running on port ${PORT}`);
+  logger.info( 'Proxying to services:', SERVICES);
+  logger.info( 'WebSocket support enabled for Socket.IO -> realtime gateway');
 }).on('error', (error: any) => {
-  secureLog('error', 'Server error:', error);
+  logger.error( 'Server error:', error);
   if (error.code === 'EADDRINUSE') {
-    secureLog('error', `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
+    logger.error( `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
     process.exit(1);
   }
 });
