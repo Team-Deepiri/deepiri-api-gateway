@@ -22,7 +22,7 @@ COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/.npmrc ./
 
 USER nodejs
 
-# npm ci installs @deepiri/shared-utils from Github Packages automatically
+# npm ci installs @team-deepiri/shared-utils from Github Packages automatically
 RUN npm ci --legacy-peer-deps && npm cache clean --force
 
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
