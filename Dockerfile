@@ -17,16 +17,16 @@ COPY --chown=root:root shared/scripts/docker-entrypoint.sh /usr/local/bin/docker
 RUN chmod +x /usr/local/bin/load-k8s-env.sh /usr/local/bin/docker-entrypoint.sh
 
 # Copy package files and .npmrc for GitHub Packages auth
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/package*.json ./
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/.npmrc ./
+COPY --chown=nodejs:nodejs package*.json ./
+COPY --chown=nodejs:nodejs .npmrc ./
 
 USER nodejs
 
 # npm ci installs @team-deepiri/shared-utils from Github Packages automatically
 RUN npm ci --legacy-peer-deps && npm cache clean --force
 
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/src ./src
+COPY --chown=nodejs:nodejs tsconfig.json ./
+COPY --chown=nodejs:nodejs src ./src
 
 RUN npm run build && \
     npm prune --production && \
