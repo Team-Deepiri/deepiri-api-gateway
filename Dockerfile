@@ -22,8 +22,11 @@ COPY --chown=nodejs:nodejs .npmrc ./
 
 USER nodejs
 
-# npm ci installs @team-deepiri/shared-utils from Github Packages automatically
-RUN npm ci --legacy-peer-deps && npm cache clean --force
+RUN --mount=type=secret,id=github_token \
+    echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/github_token)" >> .npmrc && \
+    npm ci --legacy-peer-deps && \
+    npm cache clean --force && \
+    sed -i '/_authToken/d' .npmrc
 
 COPY --chown=nodejs:nodejs tsconfig.json ./
 COPY --chown=nodejs:nodejs src ./src
