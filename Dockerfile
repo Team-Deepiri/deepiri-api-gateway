@@ -22,7 +22,7 @@ COPY --chown=nodejs:nodejs .npmrc ./
 
 USER nodejs
 
-RUN --mount=type=secret,id=github_token \
+RUN --mount=type=secret,id=github_token,uid=1001 \
     echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/github_token)" >> .npmrc && \
     npm ci --legacy-peer-deps && \
     npm cache clean --force && \
