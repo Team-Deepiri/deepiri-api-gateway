@@ -1,0 +1,17 @@
+name: deepiri-api-gateway-codeql-config
+
+# Focus analysis on maintained gateway runtime and script code.
+paths:
+  - src
+  - scripts
+  - test-perf.js
+  - test-socketio.js
+
+# Exclude generated/build/runtime artifact paths.
+paths-ignore:
+  - '**/node_modules/**'
+  - '**/dist/**'
+  - '**/build/**'
+  - '**/coverage/**'
+  - '**/logs/**'
+  - '**/*.min.js'
