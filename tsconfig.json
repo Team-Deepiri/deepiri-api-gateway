@@ -14,10 +14,7 @@
     "sourceMap": true,
     "moduleResolution": "node",
     "types": ["node"],
-    "baseUrl": ".",
-    "paths": {
-      "@deepiri/shared-utils/*": ["../../shared/deepiri-shared-utils/src/*"]
-    }
+    "baseUrl": "."
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.jsx", "**/*.tsx"],

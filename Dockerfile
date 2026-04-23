@@ -1,21 +1,19 @@
 FROM ghcr.io/team-deepiri/deepiri-base:18-alpine
 
-# Copy package files and .npmrc for GitHub Packages auth
-COPY --chown=nodejs:nodejs package*.json ./
-COPY --chown=nodejs:nodejs .npmrc ./
+COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/package*.json ./
 
 USER nodejs
 
 RUN --mount=type=secret,id=github_token,uid=1001 \
     { echo "@team-deepiri:registry=https://npm.pkg.github.com"; \
       echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/github_token)"; \
-    } > .npmrc && \
-    npm ci --legacy-peer-deps && \
-    npm cache clean --force && \
-    echo "@team-deepiri:registry=https://npm.pkg.github.com" > .npmrc
+    } > .npmrc \
+ && npm ci --legacy-peer-deps \
+ && npm cache clean --force \
+ && echo "@team-deepiri:registry=https://npm.pkg.github.com" > .npmrc
 
-COPY --chown=nodejs:nodejs tsconfig.json ./
-COPY --chown=nodejs:nodejs src ./src
+COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
+COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/src ./src
 
 RUN npm run build && \
     npm prune --production && \
