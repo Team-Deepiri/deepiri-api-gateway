@@ -11,7 +11,7 @@
  */
 
 import { Pool, PoolConfig, QueryResult, QueryResultRow } from 'pg';
-import { logger, secureLog } from '@deepiri/shared-utils';
+import { logger, secureLog } from '@team-deepiri/shared-utils';
 import promClient from 'prom-client';
 
 // ============================================================================
