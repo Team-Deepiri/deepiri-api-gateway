@@ -5,7 +5,7 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog, createLogger } from '@deepiri/shared-utils';
+import { secureLog, createLogger } from '@team-deepiri/shared-utils';
 import { bodyParserConfig, requestSizeLimiter } from './middleware/requestLimits';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';

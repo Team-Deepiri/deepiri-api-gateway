@@ -1,8 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import axios, { AxiosError }               from 'axios';
-import { hashApiKey }                      from '@deepiri/shared-utils/src/cryptoUtils';
-import { createRedisClient }               from '@deepiri/shared-utils/src/redisClient';
-import { ApiKeyCachePayload, ApiKeyScope } from '@deepiri/shared-utils/src/types';
+import { hashApiKey, createRedisClient, ApiKeyCachePayload, ApiKeyScope } from '@team-deepiri/shared-utils';
 
 const redis = createRedisClient();
 

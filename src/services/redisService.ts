@@ -9,7 +9,7 @@
  */
 
 import { createClient, RedisClientType } from 'redis';
-import { secureLog } from '@deepiri/shared-utils';
+import { secureLog } from '@team-deepiri/shared-utils';
 
 // Redis client configuration
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
