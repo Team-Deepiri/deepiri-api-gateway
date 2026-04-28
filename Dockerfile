@@ -1,16 +1,18 @@
 FROM ghcr.io/team-deepiri/deepiri-base:18-alpine
 
+COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/package*.json /shared/deepiri-shared-utils/
+COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/tsconfig.json /shared/deepiri-shared-utils/
+COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/src /shared/deepiri-shared-utils/src
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/package*.json ./
 
 USER nodejs
 
-RUN --mount=type=secret,id=github_token,uid=1001 \
-    { echo "@team-deepiri:registry=https://npm.pkg.github.com"; \
-      echo "//npm.pkg.github.com/:_authToken=$(cat /run/secrets/github_token)"; \
-    } > .npmrc \
- && npm ci --legacy-peer-deps \
- && npm cache clean --force \
- && echo "@team-deepiri:registry=https://npm.pkg.github.com" > .npmrc
+RUN cd /shared/deepiri-shared-utils \
+ && npm install --legacy-peer-deps \
+ && npm run build \
+ && cd /app \
+ && npm install --legacy-peer-deps \
+ && npm cache clean --force
 
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
 COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/src ./src
