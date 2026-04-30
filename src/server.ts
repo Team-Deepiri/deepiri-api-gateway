@@ -56,6 +56,9 @@ const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
 const logger = createLogger('api-gateway');
 
+const firstDefined = (...values: Array<string | undefined>): string | undefined =>
+  values.find((value) => typeof value === 'string' && value.trim() !== '');
+
 interface ServiceUrls {
   auth: string;
   task: string;
@@ -73,12 +76,12 @@ interface ServiceUrls {
 // Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
-  task: process.env.WORKFLOW_ORCHESTRATOR_URL || 'http://workflow-orchestrator:5002',
-  engagement: process.env.INCENTIVE_ENGINE_URL || 'http://incentive-engine:5003',
-  analytics: process.env.DECISION_INTELLIGENCE_URL || 'http://decision-intelligence:5004',
-  notification: process.env.COMMUNICATIONS_HUB_URL || 'http://communications-hub:5005',
+  task: firstDefined(process.env.WORKFLOW_ORCHESTRATOR_URL, process.env.TASK_ORCHESTRATOR_URL) || 'http://workflow-orchestrator:5002',
+  engagement: firstDefined(process.env.INCENTIVE_ENGINE_URL, process.env.ENGAGEMENT_SERVICE_URL) || 'http://incentive-engine:5003',
+  analytics: firstDefined(process.env.DECISION_INTELLIGENCE_URL, process.env.PLATFORM_ANALYTICS_SERVICE_URL) || 'http://decision-intelligence:5004',
+  notification: firstDefined(process.env.COMMUNICATIONS_HUB_URL, process.env.NOTIFICATION_SERVICE_URL) || 'http://communications-hub:5005',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
-  challenge: process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL || 'http://adaptive-experience-engine:5007',
+  challenge: firstDefined(process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://adaptive-experience-engine:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
   languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003',
@@ -94,11 +97,16 @@ const validateServiceUrls = () => {
   logger.info( 'Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
     WORKFLOW_ORCHESTRATOR_URL: process.env.WORKFLOW_ORCHESTRATOR_URL,
+    TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
     INCENTIVE_ENGINE_URL: process.env.INCENTIVE_ENGINE_URL,
+    ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
     DECISION_INTELLIGENCE_URL: process.env.DECISION_INTELLIGENCE_URL,
+    PLATFORM_ANALYTICS_SERVICE_URL: process.env.PLATFORM_ANALYTICS_SERVICE_URL,
     COMMUNICATIONS_HUB_URL: process.env.COMMUNICATIONS_HUB_URL,
+    NOTIFICATION_SERVICE_URL: process.env.NOTIFICATION_SERVICE_URL,
     EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
     ADAPTIVE_EXPERIENCE_ENGINE_URL: process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL,
+    CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
     CYREX_URL: process.env.CYREX_URL,
     LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL,
