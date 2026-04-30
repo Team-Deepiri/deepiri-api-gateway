@@ -15,6 +15,7 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+import winston from 'winston';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 
 // ============================================================================
@@ -59,6 +60,12 @@ const logger = createLogger('api-gateway');
 const firstDefined = (...values: Array<string | undefined>): string | undefined =>
   values.find((value) => typeof value === 'string' && value.trim() !== '');
 
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [new winston.transports.Console({ format: winston.format.simple() })]
+});
+
 interface ServiceUrls {
   auth: string;
   task: string;
@@ -68,9 +75,9 @@ interface ServiceUrls {
   integration: string;
   challenge: string;
   realtime: string;
+  messaging: string;
   cyrex: string;
   languageIntelligence: string;
-  messaging: string;
 }
 
 // Service URLs with validation
@@ -83,14 +90,14 @@ const SERVICES: ServiceUrls = {
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
   challenge: firstDefined(process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://adaptive-experience-engine:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
+  messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
   languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003',
-  messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009'
 };
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence', 'messaging'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
@@ -108,9 +115,9 @@ const validateServiceUrls = () => {
     ADAPTIVE_EXPERIENCE_ENGINE_URL: process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL,
     CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
+    MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL,
     CYREX_URL: process.env.CYREX_URL,
     LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL,
-    MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL
   });
 
   for (const service of requiredServices) {
@@ -146,9 +153,9 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
     challenge: 'ADAPTIVE_EXPERIENCE_ENGINE_URL',
     realtime: 'REALTIME_GATEWAY_URL',
+    messaging: 'MESSAGING_SERVICE_URL',
     cyrex: 'CYREX_URL',
     languageIntelligence: 'LANGUAGE_INTELLIGENCE_SERVICE_URL',
-    messaging: 'MESSAGING_SERVICE_URL'
   };
   return envMap[service];
 };
@@ -164,9 +171,9 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
     integration: 'http://external-bridge-service:5006',
     challenge: 'http://adaptive-experience-engine:5007',
     realtime: 'http://realtime-gateway:5008',
+    messaging: 'http://messaging-service:5009',
     cyrex: 'http://cyrex:8000',
     languageIntelligence: 'http://language-intelligence-service:5003',
-    messaging: 'http://messaging-service:5009'
   };
   return defaults[service];
 };
@@ -761,6 +768,7 @@ app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.analytics))
 app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.notification)));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
+app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
 app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
