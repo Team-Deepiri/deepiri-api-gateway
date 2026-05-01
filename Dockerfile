@@ -1,25 +1,32 @@
 FROM ghcr.io/team-deepiri/deepiri-base:18-alpine
 
-COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/package*.json /shared/deepiri-shared-utils/
-COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/tsconfig.json /shared/deepiri-shared-utils/
-COPY --chown=nodejs:nodejs shared/deepiri-shared-utils/src /shared/deepiri-shared-utils/src
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/package*.json ./
+COPY shared/deepiri-shared-utils/package*.json /shared/deepiri-shared-utils/
+COPY shared/deepiri-shared-utils/tsconfig.json /shared/deepiri-shared-utils/
+COPY shared/deepiri-shared-utils/src /shared/deepiri-shared-utils/src
+COPY backend/deepiri-api-gateway/package*.json ./
 
-USER nodejs
-
-RUN cd /shared/deepiri-shared-utils \
- && npm install --legacy-peer-deps \
- && npm run build \
+RUN node -e "const fs=require('fs'),lock=JSON.parse(fs.readFileSync('package-lock.json'));delete lock.packages['../../shared/deepiri-shared-utils'];delete lock.packages['node_modules/@team-deepiri/shared-utils'];fs.writeFileSync('package-lock.json',JSON.stringify(lock));" \
+ && cd /shared/deepiri-shared-utils \
+ && npm ci --legacy-peer-deps \
+ && node -e "const fs=require('fs'),p=JSON.parse(fs.readFileSync('package.json'));delete p.scripts.prepare;fs.writeFileSync('package.json',JSON.stringify(p,null,2));" \
+ && rm -rf node_modules \
  && cd /app \
  && npm install --legacy-peer-deps \
+ && cd /shared/deepiri-shared-utils \
+ && npm ci --omit=dev --legacy-peer-deps \
+ && cd /app \
  && npm cache clean --force
 
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/tsconfig.json ./
-COPY --chown=nodejs:nodejs backend/deepiri-api-gateway/src ./src
+COPY backend/deepiri-api-gateway/tsconfig.json ./
+COPY backend/deepiri-api-gateway/src ./src
 
 RUN npm run build && \
-    npm prune --production && \
+    npm prune --omit=dev && \
     npm cache clean --force
+
+RUN mkdir -p logs && chown -R nodejs:nodejs /app
+
+USER nodejs
 
 EXPOSE 5000
 
