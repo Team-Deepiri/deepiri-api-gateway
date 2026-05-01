@@ -15,7 +15,6 @@ import * as redisService from './services/redisService';
 import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
-import winston from 'winston';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 
 // ============================================================================
@@ -60,11 +59,6 @@ const logger = createLogger('api-gateway');
 const firstDefined = (...values: Array<string | undefined>): string | undefined =>
   values.find((value) => typeof value === 'string' && value.trim() !== '');
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [new winston.transports.Console({ format: winston.format.simple() })]
-});
 
 interface ServiceUrls {
   auth: string;
