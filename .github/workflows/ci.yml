@@ -12,11 +12,10 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   ci:
-    name: Test, Build & Docker
+    name: Install, Test & Build
     runs-on: ubuntu-latest
 
     steps:
