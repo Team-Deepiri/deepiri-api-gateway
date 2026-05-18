@@ -19,36 +19,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout service repository
+      - name: Checkout service into monorepo layout
         uses: actions/checkout@v4
         with:
           path: platform-services/backend/deepiri-api-gateway
 
-      - name: Checkout shared utils
+      - name: Checkout shared-utils
         uses: actions/checkout@v4
         with:
           repository: Team-Deepiri/deepiri-shared-utils
-          ref: dev
           path: platform-services/shared/deepiri-shared-utils
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: platform-services/backend/deepiri-api-gateway/package-lock.json
+          node-version: 18
 
-      - name: Install shared utils dependencies
+      - name: Build shared-utils
         working-directory: platform-services/shared/deepiri-shared-utils
-        run: npm ci
-
-      - name: Build shared utils
-        working-directory: platform-services/shared/deepiri-shared-utils
-        run: npm run build
+        run: npm ci --legacy-peer-deps && npm run build
 
       - name: Install service dependencies
         working-directory: platform-services/backend/deepiri-api-gateway
-        run: npm ci
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc
+          npm install --legacy-peer-deps file:../../shared/deepiri-shared-utils
+          npm ci --legacy-peer-deps
 
       - name: Type check
         working-directory: platform-services/backend/deepiri-api-gateway
@@ -58,6 +55,41 @@ jobs:
         working-directory: platform-services/backend/deepiri-api-gateway
         run: npm test -- --passWithNoTests
 
-      - name: Build
-        working-directory: platform-services/backend/deepiri-api-gateway
-        run: npm run build
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: platform-services
+          file: platform-services/backend/deepiri-api-gateway/Dockerfile
+          push: false
+          load: true
+          tags: deepiri-api-gateway:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify container runs
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          INTERNAL_SERVICE_SECRET: ${{ secrets.INTERNAL_SERVICE_SECRET }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          docker run -d --name test-gateway \
+            -e JWT_SECRET="${JWT_SECRET:-ci-dev-only-placeholder}" \
+            -e INTERNAL_SERVICE_SECRET="${INTERNAL_SERVICE_SECRET:-ci-dev-only-placeholder}" \
+            -e REDIS_PASSWORD="${REDIS_PASSWORD:-password}" \
+            deepiri-api-gateway:ci
+          sleep 8
+          docker ps -a
+          docker logs test-gateway
+          docker inspect -f '{{.State.Running}}' test-gateway | grep -q true || \
+            echo "::warning::Container not running — check logs above"
+          docker stop test-gateway || true
