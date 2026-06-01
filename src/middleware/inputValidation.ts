@@ -1,14 +1,5 @@
 import { NextFunction, Request, Response } from 'express';
-import { logger } from '@deepiri/shared-utils';
-
-export const secureLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: unknown): void => {
-    const logMethod = (logger as any)[level] ?? logger.info;
-    if (meta !== undefined) {
-        logMethod(message, meta);
-        return;
-    }
-    logMethod(message);
-};
+import { secureLog } from '@team-deepiri/shared-utils';
 
 type BodyValidator = (body: Record<string, unknown>) => string | null;
 type QueryValidator = (query: Record<string, unknown>) => string | null;
