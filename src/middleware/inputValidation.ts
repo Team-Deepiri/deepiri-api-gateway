@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { logger } from '@deepiri/shared-utils';
 
-const secureLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: unknown): void => {
+export const secureLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: unknown): void => {
     const logMethod = (logger as any)[level] ?? logger.info;
     if (meta !== undefined) {
         logMethod(message, meta);
@@ -97,8 +97,14 @@ export const validateBody = (options: BodyValidationOptions = {}) => {
     return (req: Request, res: Response, next: NextFunction): void => {
         const requestId = (req.headers['x-request-id'] as string) || 'unknown';
         const errors: Array<{ field: string; message: string; value?: unknown }> = [];
+        const isEmptyBodyObject =
+            req.body !== undefined &&
+            req.body !== null &&
+            typeof req.body === 'object' &&
+            !Array.isArray(req.body) &&
+            Object.keys(req.body).length === 0;
 
-        if (options.required && (req.body === undefined || req.body === null)) {
+        if (options.required && (req.body === undefined || req.body === null || isEmptyBodyObject)) {
             errors.push({
                 field: 'body',
                 message: 'Request body is required',

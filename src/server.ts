@@ -602,7 +602,9 @@ app.post(
   validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
   validateBody({ required: true }),
   (req: Request, res: Response) => {
-    secureLog('info', 'Test endpoint called', { body: req.body, headers: req.headers });
+    logger.info('Test endpoint called', {
+      requestId: req.headers['x-request-id'] || 'unknown',
+    });
     res.json({
       status: 'ok',
       message: 'API Gateway is working',
