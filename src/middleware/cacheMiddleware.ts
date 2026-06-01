@@ -11,7 +11,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import * as redisService from '../services/redisService';
-import { logger, secureLog } from '@deepiri/shared-utils';
+import { logger, secureLog } from '@team-deepiri/shared-utils';
 
 interface CacheOptions {
   ttlSeconds?: number;

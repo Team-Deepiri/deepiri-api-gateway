@@ -5,7 +5,7 @@ import { Socket } from 'net';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { secureLog, createLogger } from '@deepiri/shared-utils';
+import { secureLog, createLogger } from '@team-deepiri/shared-utils';
 import { bodyParserConfig, requestSizeLimiter } from './middleware/requestLimits';
 import promClient from 'prom-client';
 import rateLimit from 'express-rate-limit';
@@ -64,6 +64,10 @@ const httpServer: HttpServer = createServer(app);
 const PORT: number = parseInt(process.env.PORT || '5000', 10);
 const logger = createLogger('api-gateway');
 
+const firstDefined = (...values: Array<string | undefined>): string | undefined =>
+  values.find((value) => typeof value === 'string' && value.trim() !== '');
+
+
 interface ServiceUrls {
   auth: string;
   task: string;
@@ -73,44 +77,49 @@ interface ServiceUrls {
   integration: string;
   challenge: string;
   realtime: string;
+  messaging: string;
   cyrex: string;
   languageIntelligence: string;
-  messaging: string;
 }
 
 // Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
-  task: process.env.TASK_ORCHESTRATOR_URL || 'http://task-orchestrator:5002',
-  engagement: process.env.ENGAGEMENT_SERVICE_URL || 'http://engagement-service:5003',
-  analytics: process.env.PLATFORM_ANALYTICS_SERVICE_URL || 'http://platform-analytics-service:5004',
-  notification: process.env.NOTIFICATION_SERVICE_URL || 'http://notification-service:5005',
+  task: firstDefined(process.env.WORKFLOW_ORCHESTRATOR_URL, process.env.TASK_ORCHESTRATOR_URL) || 'http://workflow-orchestrator:5002',
+  engagement: firstDefined(process.env.INCENTIVE_ENGINE_URL, process.env.ENGAGEMENT_SERVICE_URL) || 'http://incentive-engine:5003',
+  analytics: firstDefined(process.env.DECISION_INTELLIGENCE_URL, process.env.PLATFORM_ANALYTICS_SERVICE_URL) || 'http://decision-intelligence:5004',
+  notification: firstDefined(process.env.COMMUNICATIONS_HUB_URL, process.env.NOTIFICATION_SERVICE_URL) || 'http://communications-hub:5005',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
-  challenge: process.env.CHALLENGE_SERVICE_URL || 'http://challenge-service:5007',
+  challenge: firstDefined(process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://adaptive-experience-engine:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
+  messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
   languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003',
-  messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009'
 };
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'cyrex', 'languageIntelligence', 'messaging'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
   logger.info( 'Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
+    WORKFLOW_ORCHESTRATOR_URL: process.env.WORKFLOW_ORCHESTRATOR_URL,
     TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
+    INCENTIVE_ENGINE_URL: process.env.INCENTIVE_ENGINE_URL,
     ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
+    DECISION_INTELLIGENCE_URL: process.env.DECISION_INTELLIGENCE_URL,
     PLATFORM_ANALYTICS_SERVICE_URL: process.env.PLATFORM_ANALYTICS_SERVICE_URL,
+    COMMUNICATIONS_HUB_URL: process.env.COMMUNICATIONS_HUB_URL,
     NOTIFICATION_SERVICE_URL: process.env.NOTIFICATION_SERVICE_URL,
     EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
+    ADAPTIVE_EXPERIENCE_ENGINE_URL: process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL,
     CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
     REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
+    MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL,
     CYREX_URL: process.env.CYREX_URL,
     LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL,
-    MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL
   });
 
   for (const service of requiredServices) {
@@ -139,16 +148,16 @@ const validateServiceUrls = () => {
 const getEnvVarName = (service: keyof ServiceUrls): string => {
   const envMap: Record<keyof ServiceUrls, string> = {
     auth: 'AUTH_SERVICE_URL',
-    task: 'TASK_ORCHESTRATOR_URL',
-    engagement: 'ENGAGEMENT_SERVICE_URL',
-    analytics: 'PLATFORM_ANALYTICS_SERVICE_URL',
-    notification: 'NOTIFICATION_SERVICE_URL',
+    task: 'WORKFLOW_ORCHESTRATOR_URL',
+    engagement: 'INCENTIVE_ENGINE_URL',
+    analytics: 'DECISION_INTELLIGENCE_URL',
+    notification: 'COMMUNICATIONS_HUB_URL',
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
-    challenge: 'CHALLENGE_SERVICE_URL',
+    challenge: 'ADAPTIVE_EXPERIENCE_ENGINE_URL',
     realtime: 'REALTIME_GATEWAY_URL',
+    messaging: 'MESSAGING_SERVICE_URL',
     cyrex: 'CYREX_URL',
     languageIntelligence: 'LANGUAGE_INTELLIGENCE_SERVICE_URL',
-    messaging: 'MESSAGING_SERVICE_URL'
   };
   return envMap[service];
 };
@@ -157,16 +166,16 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
 const getDefaultUrl = (service: keyof ServiceUrls): string => {
   const defaults: Record<keyof ServiceUrls, string> = {
     auth: 'http://auth-service:5001',
-    task: 'http://task-orchestrator:5002',
-    engagement: 'http://engagement-service:5003',
-    analytics: 'http://platform-analytics-service:5004',
-    notification: 'http://notification-service:5005',
+    task: 'http://workflow-orchestrator:5002',
+    engagement: 'http://incentive-engine:5003',
+    analytics: 'http://decision-intelligence:5004',
+    notification: 'http://communications-hub:5005',
     integration: 'http://external-bridge-service:5006',
-    challenge: 'http://challenge-service:5007',
+    challenge: 'http://adaptive-experience-engine:5007',
     realtime: 'http://realtime-gateway:5008',
+    messaging: 'http://messaging-service:5009',
     cyrex: 'http://cyrex:8000',
     languageIntelligence: 'http://language-intelligence-service:5003',
-    messaging: 'http://messaging-service:5009'
   };
   return defaults[service];
 };
@@ -771,6 +780,7 @@ app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.analytics))
 app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.notification)));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
+app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
 app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
