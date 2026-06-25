@@ -27,11 +27,29 @@ interface HeaderValidationOptions {
 
 const APP_HEADER_PREFIX = 'x-';
 
+// Standard proxy/infrastructure headers that should never be subject to
+// application-level allowlist validation. These are set by load balancers,
+// reverse proxies, and CDNs and must be passed through transparently.
+const PROXY_HEADER_NAMES = new Set([
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-port',
+    'x-forwarded-proto',
+    'x-forwarded-prefix',
+    'x-forwarded-server',
+    'x-real-ip',
+    'x-amzn-trace-id',
+    'x-request-start',
+]);
+
 const getAppHeaders = (headers: Record<string, unknown>): Record<string, unknown> => {
     const appHeaders: Record<string, unknown> = {};
 
     for (const [key, value] of Object.entries(headers)) {
         const normalized = key.toLowerCase();
+        if (PROXY_HEADER_NAMES.has(normalized)) {
+            continue;
+        }
         if (normalized === 'authorization' || normalized.startsWith(APP_HEADER_PREFIX)) {
             appHeaders[normalized] = value;
         }
