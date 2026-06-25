@@ -742,6 +742,7 @@ const writeValidatedJsonBodyToProxy = (proxyReq: any, req: Request): void => {
   const serializedBody = JSON.stringify(req.body);
   proxyReq.setHeader('Content-Length', Buffer.byteLength(serializedBody));
   proxyReq.write(serializedBody);
+  proxyReq.end();
 };
 
 // Proxy routes with proper body restreaming
@@ -798,56 +799,73 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
-// Auth routes with enhanced logging
-const authProxyOptions: any = createProxy(SERVICES.auth, { '^/': '/auth/' });
-// Override onProxyReq to add detailed logging
-const originalAuthOnProxyReq = authProxyOptions.onProxyReq;
-const originalAuthOnProxyRes = authProxyOptions.onProxyRes;
-authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
-  const rewrittenPath = req.path.replace(/^\//, '/auth/');
-  const contentType = req.get('content-type') || 'unknown';
-  const contentLength = req.get('content-length') || 'unknown';
+// Auth routes — use http-proxy-middleware v3 on.* API so body re-streaming and
+// header validation are always wired correctly.
+const authProxyOptions = {
+  target: SERVICES.auth,
+  changeOrigin: true,
+  pathRewrite: { '^/': '/auth/' },
+  timeout: 30000,
+  proxyTimeout: 30000,
+  selfHandleResponse: false,
+  on: {
+    proxyReq: (proxyReq: any, req: any, _res: any) => {
+      try {
+        // Re-stream the body consumed by authValidationMiddleware. The function
+        // also calls proxyReq.end() so http-proxy skips its req.pipe(proxyReq)
+        // path when the source stream has already been drained.
+        writeValidatedJsonBodyToProxy(proxyReq, req);
 
-  writeValidatedJsonBodyToProxy(proxyReq, req);
-
-  logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
-    contentType,
-    contentLength,
-    headers: {
-      'content-type': req.get('content-type'),
-      'content-length': req.get('content-length'),
-      'authorization': req.get('authorization') ? 'present' : 'missing'
-    }
-  });
-  // Call original handler if it exists
-  if (originalAuthOnProxyReq) {
-    originalAuthOnProxyReq(proxyReq, req, res);
-  }
+        const rewrittenPath = req.path.replace(/^\//, '/auth/');
+        logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+          contentType: req.get('content-type') || 'unknown',
+          contentLength: req.get('content-length') || 'unknown',
+          headers: {
+            'content-type': req.get('content-type'),
+            'content-length': req.get('content-length'),
+            'authorization': req.get('authorization') ? 'present' : 'missing',
+          },
+        });
+      } catch (error) {
+        logger.error('Error in auth onProxyReq:', error);
+      }
+    },
+    proxyRes: (proxyRes: any, req: any, _res: any) => {
+      logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+        statusCode: proxyRes.statusCode,
+        headers: {
+          'content-type': proxyRes.headers['content-type'],
+          'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
+          'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials'],
+        },
+      });
+      if (!proxyRes.headers['access-control-allow-origin']) {
+        logger.warn('[AUTH] Missing CORS headers in response from auth service');
+      }
+    },
+    error: (err: any, req: any, res: any) => {
+      logger.error('Auth proxy error:', {
+        error: err.message,
+        target: SERVICES.auth,
+        path: req.originalUrl || req.path,
+        method: req.method,
+        stack: err.stack,
+      });
+      if (!res.headersSent) {
+        res.status(503).json({ error: 'Service unavailable', message: err.message });
+      }
+    },
+  },
 };
-authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
-  // Log the response
-  logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
-    statusCode: proxyRes.statusCode,
-    headers: {
-      'content-type': proxyRes.headers['content-type'],
-      'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
-      'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
-    }
-  });
 
-  // Ensure CORS headers are properly set from the auth service response
-  // Don't overwrite them - let the auth service's CORS middleware handle it
-  // But log if they're missing
-  if (!proxyRes.headers['access-control-allow-origin']) {
-    logger.warn(`[AUTH] Missing CORS headers in response from auth service`);
-  }
-
-  // Call original handler if it exists
-  if (originalAuthOnProxyRes) {
-    originalAuthOnProxyRes(proxyRes, req, res);
-  }
-};
-app.use('/api/auth', authValidationMiddleware, createProxyMiddleware(authProxyOptions));
+// Wire header validation before body validation so unknown x-* headers
+// (e.g. x-internal-secret) are rejected before the body is ever parsed.
+app.use(
+  '/api/auth',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  authValidationMiddleware,
+  createProxyMiddleware(authProxyOptions)
+);
 
 app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.task, { '^/': '/tasks/' })));
 app.use('/api/gamification', createProxyMiddleware(createProxy(SERVICES.engagement)));
