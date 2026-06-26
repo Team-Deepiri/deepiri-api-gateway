@@ -1,4 +1,4 @@
-import express, { Express, Request, Response, ErrorRequestHandler } from 'express';
+import express, { Express, Request, Response, NextFunction, ErrorRequestHandler } from 'express';
 import { createProxyMiddleware, Options } from 'http-proxy-middleware';
 import { createServer, Server as HttpServer } from 'http';
 import { Socket } from 'net';
@@ -16,6 +16,14 @@ import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
+import {
+  validateBody,
+  validateHeaders,
+  validateQuery,
+  validateRedisDirectBody,
+  validateDbQueryParams,
+  validateDbComparisonQueryParams,
+} from './middleware/inputValidation';
 
 // ============================================================================
 // PROMETHEUS METRICS SETUP
@@ -95,7 +103,7 @@ const validateServiceUrls = () => {
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
-  logger.info( 'Environment variables check:', {
+  logger.info('Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
     WORKFLOW_ORCHESTRATOR_URL: process.env.WORKFLOW_ORCHESTRATOR_URL,
     TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
@@ -118,7 +126,7 @@ const validateServiceUrls = () => {
     const serviceUrl = SERVICES[service];
     if (!serviceUrl || (typeof serviceUrl === 'string' && serviceUrl.trim() === '')) {
       missingServices.push(service);
-      logger.error( `Service URL missing for ${service}:`, {
+      logger.error(`Service URL missing for ${service}:`, {
         envVar: getEnvVarName(service),
         value: process.env[getEnvVarName(service)],
         default: getDefaultUrl(service),
@@ -128,12 +136,12 @@ const validateServiceUrls = () => {
   }
 
   if (missingServices.length > 0) {
-    logger.error( 'Missing or empty service URLs:', missingServices);
-    logger.error( 'Current SERVICES configuration:', SERVICES);
+    logger.error('Missing or empty service URLs:', missingServices);
+    logger.error('Current SERVICES configuration:', SERVICES);
     throw new Error(`Missing required service URLs: ${missingServices.join(', ')}`);
   }
 
-  logger.info( 'All service URLs validated successfully:', SERVICES);
+  logger.info('All service URLs validated successfully:', SERVICES);
 };
 
 // Helper to get environment variable name
@@ -194,9 +202,9 @@ app.use((req: Request, res: Response, next) => {
   if (req.path === '/metrics') {
     return next();
   }
-  
+
   const end = httpRequestDuration.startTimer();
-  
+
   res.on('finish', () => {
     const route = req.route?.path || req.path.split('/').slice(0, 3).join('/') || 'unknown';
     const labels = {
@@ -207,26 +215,26 @@ app.use((req: Request, res: Response, next) => {
     end(labels);
     httpRequestTotal.inc(labels);
   });
-  
+
   next();
 });
 
 // Initialize Redis and DB connection pools
 async function initializeServices() {
   try {
-    logger.info( 'Initializing Redis connection pool...');
+    logger.info('Initializing Redis connection pool...');
     await redisService.initRedis();
-    logger.info( 'Redis connection pool ready');
+    logger.info('Redis connection pool ready');
   } catch (error: any) {
-    logger.warn( 'Redis initialization failed (will retry on first use):', error.message);
+    logger.warn('Redis initialization failed (will retry on first use):', error.message);
   }
 
   try {
-    logger.info( 'Initializing PostgreSQL connection pool...');
+    logger.info('Initializing PostgreSQL connection pool...');
     await dbService.initDb();
-    logger.info( 'PostgreSQL connection pool ready');
+    logger.info('PostgreSQL connection pool ready');
   } catch (error: any) {
-    logger.warn( 'PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn('PostgreSQL initialization failed (will retry on first use):', error.message);
   }
 }
 
@@ -236,14 +244,18 @@ initializeServices();
 // Health check needs to come BEFORE proxy routes
 app.set("trust proxy", 1);
 app.get('/health', async (req: Request, res: Response) => {
-  const redisHealthy = await redisService.isHealthy();
-  const dbHealthy = await dbService.isHealthy();
-  
-  res.json({ 
-    status: 'healthy', 
+  const [redisHealthy, dbHealthy] = await Promise.all([
+    redisService.isHealthy(),
+    dbService.isHealthy()
+  ]);
+
+  res.json({
+    status: 'healthy',
     service: 'api-gateway',
-    redis: redisHealthy ? 'healthy' : 'unhealthy',
-    database: dbHealthy ? 'healthy' : 'unhealthy'
+    services: Object.keys(SERVICES),
+    redis: redisHealthy ? 'connected' : 'disconnected',
+    database: dbHealthy ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -309,7 +321,7 @@ class RequestQueue {
     private readonly maxQueueSize = 100,
     private readonly processDelay = 100,
     private readonly maxWaitMs = 10_000
-  ) {}
+  ) { }
 
   enqueue(
     req: Request,
@@ -519,10 +531,10 @@ app.use("/api", (req, res, next) => {
 // Test endpoint for rate limiting validation (only enabled in non-prod or with flag)
 if (process.env.ENABLE_RL_TEST_ENDPOINT === 'true' || process.env.NODE_ENV !== 'production') {
   app.get('/api/rl-test', (req: Request, res: Response) => {
-    res.json({ 
-      ok: true, 
-      ts: new Date().toISOString(), 
-      ip: req.ip 
+    res.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      ip: req.ip
     });
   });
 }
@@ -584,30 +596,36 @@ app.get('/metrics', async (req: Request, res: Response) => {
   try {
     // Update database pool metrics before serving
     dbService.updatePoolMetrics();
-    
+
     res.set('Content-Type', promClient.register.contentType);
     res.end(await promClient.register.metrics());
   } catch (error: any) {
-    logger.error( 'Error generating metrics:', error.message);
+    logger.error('Error generating metrics:', error.message);
     res.status(500).end(error.message);
   }
 });
 
 // Test endpoint to verify the gateway is working
-app.post('/test', (req: Request, res: Response) => {
-  logger.info( 'Test endpoint called', { body: req.body, headers: req.headers });
-  res.json({
-    status: 'ok',
-    message: 'API Gateway is working',
-    receivedBody: req.body,
-    timestamp: new Date().toISOString()
+app.post(
+  '/test',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateBody({ required: true }),
+  (req: Request, res: Response) => {
+    logger.info('Test endpoint called', {
+      requestId: req.headers['x-request-id'] || 'unknown',
+    });
+    res.json({
+      status: 'ok',
+      message: 'API Gateway is working',
+      receivedBody: req.body,
+      timestamp: new Date().toISOString()
+    });
   });
-});
 
 // Log all incoming requests BEFORE body parsing
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
-    logger.info( `[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
+    logger.info(`[INCOMING] ${req.method} ${req.originalUrl || req.path}`, {
       headers: {
         'content-type': req.get('content-type'),
         'content-length': req.get('content-length'),
@@ -649,10 +667,83 @@ app.use((req, res, next) => {
       });
     });
   } catch (error) {
-    logger.error( 'Body parsing error:', error);
+    logger.error('Body parsing error:', error);
     next(error);
   }
 });
+
+type AuthBodyValidationRule = {
+  methods: string[];
+  required?: boolean;
+  allowedFields?: string[];
+};
+
+const AUTH_BODY_VALIDATION_RULES: Record<string, AuthBodyValidationRule> = {
+  '/login': {
+    methods: ['POST'],
+    required: true,
+    allowedFields: ['email', 'username', 'identifier', 'password', 'rememberMe'],
+  },
+  '/register': {
+    methods: ['POST'],
+    required: true,
+    allowedFields: ['email', 'username', 'password', 'confirmPassword', 'firstName', 'lastName'],
+  },
+  '/forgot-password': {
+    methods: ['POST'],
+    required: true,
+    allowedFields: ['email'],
+  },
+  '/reset-password': {
+    methods: ['POST'],
+    required: true,
+    allowedFields: ['token', 'password', 'confirmPassword'],
+  },
+  '/refresh-token': {
+    methods: ['POST'],
+    required: true,
+    allowedFields: ['refreshToken'],
+  },
+};
+
+const authValidationMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+  const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+  const rule = AUTH_BODY_VALIDATION_RULES[normalizedPath];
+
+  if (!rule || !rule.methods.includes(req.method.toUpperCase())) {
+    return next();
+  }
+
+  express.json(bodyParserConfig.json)(req, res, (err) => {
+    if (err) {
+      secureLog('error', 'Auth JSON body parsing error:', err);
+      return next(err);
+    }
+
+    return validateBody({
+      required: rule.required,
+      allowedFields: rule.allowedFields,
+    })(req, res, next);
+  });
+};
+
+const writeValidatedJsonBodyToProxy = (proxyReq: any, req: Request): void => {
+  if (req.body === undefined || req.body === null || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return;
+  }
+
+  const contentType = proxyReq.getHeader('Content-Type');
+  const contentTypeValue = Array.isArray(contentType) ? contentType.join(';') : String(contentType || '');
+
+  if (!contentTypeValue.toLowerCase().includes('application/json')) {
+    return;
+  }
+
+  const serializedBody = JSON.stringify(req.body);
+  proxyReq.setHeader('Content-Length', Buffer.byteLength(serializedBody));
+  proxyReq.write(serializedBody);
+  proxyReq.end();
+};
 
 // Proxy routes with proper body restreaming
 // http-proxy-middleware handles body streaming automatically, but we need to
@@ -674,22 +765,22 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const contentType = req.get('content-type') || 'unknown';
         const contentLength = req.get('content-length') || 'unknown';
-        logger.info( `Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
+        logger.info(`Proxying ${req.method} ${req.originalUrl || req.path} to ${target}`, {
           contentType,
           contentLength,
           hasBody: !!req.body
         });
       }
     } catch (error) {
-      logger.error( 'Error in onProxyReq:', error);
+      logger.error('Error in onProxyReq:', error);
     }
   },
   onProxyRes: (proxyRes: any, req: any, res: any) => {
     // Log response but don't modify CORS headers - let backend service handle them
-    logger.info( `Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
+    logger.info(`Proxy response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode} (target: ${target})`);
   },
   onError: (err: any, req: any, res: any) => {
-    logger.error( 'Proxy error:', {
+    logger.error('Proxy error:', {
       error: err.message,
       target,
       path: req.originalUrl || req.path,
@@ -708,53 +799,73 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
-// Auth routes with enhanced logging
-const authProxyOptions: any = createProxy(SERVICES.auth, { '^/': '/auth/' });
-// Override onProxyReq to add detailed logging
-const originalAuthOnProxyReq = authProxyOptions.onProxyReq;
-const originalAuthOnProxyRes = authProxyOptions.onProxyRes;
-authProxyOptions.onProxyReq = (proxyReq: any, req: any, res: any) => {
-  const rewrittenPath = req.path.replace(/^\//, '/auth/');
-  const contentType = req.get('content-type') || 'unknown';
-  const contentLength = req.get('content-length') || 'unknown';
-  logger.info( `[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
-    contentType,
-    contentLength,
-    headers: {
-      'content-type': req.get('content-type'),
-      'content-length': req.get('content-length'),
-      'authorization': req.get('authorization') ? 'present' : 'missing'
-    }
-  });
-  // Call original handler if it exists
-  if (originalAuthOnProxyReq) {
-    originalAuthOnProxyReq(proxyReq, req, res);
-  }
-};
-authProxyOptions.onProxyRes = (proxyRes: any, req: any, res: any) => {
-  // Log the response
-  logger.info( `[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
-    statusCode: proxyRes.statusCode,
-    headers: {
-      'content-type': proxyRes.headers['content-type'],
-      'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
-      'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials']
-    }
-  });
+// Auth routes — use http-proxy-middleware v3 on.* API so body re-streaming and
+// header validation are always wired correctly.
+const authProxyOptions = {
+  target: SERVICES.auth,
+  changeOrigin: true,
+  pathRewrite: { '^/': '/auth/' },
+  timeout: 30000,
+  proxyTimeout: 30000,
+  selfHandleResponse: false,
+  on: {
+    proxyReq: (proxyReq: any, req: any, _res: any) => {
+      try {
+        // Re-stream the body consumed by authValidationMiddleware. The function
+        // also calls proxyReq.end() so http-proxy skips its req.pipe(proxyReq)
+        // path when the source stream has already been drained.
+        writeValidatedJsonBodyToProxy(proxyReq, req);
 
-  // Ensure CORS headers are properly set from the auth service response
-  // Don't overwrite them - let the auth service's CORS middleware handle it
-  // But log if they're missing
-  if (!proxyRes.headers['access-control-allow-origin']) {
-    logger.warn( `[AUTH] Missing CORS headers in response from auth service`);
-  }
-
-  // Call original handler if it exists
-  if (originalAuthOnProxyRes) {
-    originalAuthOnProxyRes(proxyRes, req, res);
-  }
+        const rewrittenPath = req.path.replace(/^\//, '/auth/');
+        logger.info(`[AUTH] Proxying ${req.method} ${req.originalUrl || req.path} -> ${SERVICES.auth}${rewrittenPath}`, {
+          contentType: req.get('content-type') || 'unknown',
+          contentLength: req.get('content-length') || 'unknown',
+          headers: {
+            'content-type': req.get('content-type'),
+            'content-length': req.get('content-length'),
+            'authorization': req.get('authorization') ? 'present' : 'missing',
+          },
+        });
+      } catch (error) {
+        logger.error('Error in auth onProxyReq:', error);
+      }
+    },
+    proxyRes: (proxyRes: any, req: any, _res: any) => {
+      logger.info(`[AUTH] Response: ${req.method} ${req.originalUrl || req.path} -> ${proxyRes.statusCode}`, {
+        statusCode: proxyRes.statusCode,
+        headers: {
+          'content-type': proxyRes.headers['content-type'],
+          'access-control-allow-origin': proxyRes.headers['access-control-allow-origin'],
+          'access-control-allow-credentials': proxyRes.headers['access-control-allow-credentials'],
+        },
+      });
+      if (!proxyRes.headers['access-control-allow-origin']) {
+        logger.warn('[AUTH] Missing CORS headers in response from auth service');
+      }
+    },
+    error: (err: any, req: any, res: any) => {
+      logger.error('Auth proxy error:', {
+        error: err.message,
+        target: SERVICES.auth,
+        path: req.originalUrl || req.path,
+        method: req.method,
+        stack: err.stack,
+      });
+      if (!res.headersSent) {
+        res.status(503).json({ error: 'Service unavailable', message: err.message });
+      }
+    },
+  },
 };
-app.use('/api/auth', createProxyMiddleware(authProxyOptions));
+
+// Wire header validation before body validation so unknown x-* headers
+// (e.g. x-internal-secret) are rejected before the body is ever parsed.
+app.use(
+  '/api/auth',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  authValidationMiddleware,
+  createProxyMiddleware(authProxyOptions)
+);
 
 app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.task, { '^/': '/tasks/' })));
 app.use('/api/gamification', createProxyMiddleware(createProxy(SERVICES.engagement)));
@@ -770,7 +881,7 @@ app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, 
 app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
-  logger.error( 'Proxy error:', {
+  logger.error('Proxy error:', {
     error: err.message,
     stack: err.stack,
     path: req.path,
@@ -799,7 +910,7 @@ app.use('/api/test', express.json());
  */
 app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req: Request, res: Response) => {
   const timer = new Timer();
-  
+
   // Simulate some processing work
   const data = {
     message: 'This response can be cached in Redis',
@@ -807,7 +918,7 @@ app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req
     randomValue: Math.random(),
     processingTimeMs: timer.elapsedMs().toFixed(3)
   };
-  
+
   res.json(data);
 });
 
@@ -815,192 +926,215 @@ app.get('/api/test/redis-cache', cacheMiddleware({ ttlSeconds: 60 }), async (req
  * Test endpoint: Direct Redis GET/SET operations
  * Shows raw Redis performance with timing
  */
-app.post('/api/test/redis-direct', async (req: Request, res: Response) => {
-  const { key, value, iterations = 1 } = req.body;
-  
-  if (!key) {
-    return res.status(400).json({ error: 'key is required' });
-  }
-  
-  const setTimings: bigint[] = [];
-  const getTimings: bigint[] = [];
-  
-  try {
-    // Perform SET operations
-    for (let i = 0; i < iterations; i++) {
-      const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
-      setTimings.push(setResult.timeNs);
+app.post(
+  '/api/test/redis-direct',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateBody({
+    required: true,
+    allowedFields: ['key', 'value', 'iterations'],
+    validators: [validateRedisDirectBody],
+  }),
+  async (req: Request, res: Response) => {
+    const { key, value, iterations = 1 } = req.body;
+
+    if (!key) {
+      return res.status(400).json({ error: 'key is required' });
     }
-    
-    // Perform GET operations  
-    for (let i = 0; i < iterations; i++) {
-      const getResult = await redisService.get(`test:${key}:${i}`);
-      getTimings.push(getResult.timeNs);
+
+    const setTimings: bigint[] = [];
+    const getTimings: bigint[] = [];
+
+    try {
+      // Perform SET operations
+      for (let i = 0; i < iterations; i++) {
+        const setResult = await redisService.set(`test:${key}:${i}`, value || `value-${i}`, 60);
+        setTimings.push(setResult.timeNs);
+      }
+
+      // Perform GET operations
+      for (let i = 0; i < iterations; i++) {
+        const getResult = await redisService.get(`test:${key}:${i}`);
+        getTimings.push(getResult.timeNs);
+      }
+
+      const setStats = calculateStats(setTimings);
+      const getStats = calculateStats(getTimings);
+
+      res.json({
+        success: true,
+        iterations,
+        setOperations: {
+          avgMs: setStats.avgMs.toFixed(3),
+          minMs: setStats.minMs.toFixed(3),
+          maxMs: setStats.maxMs.toFixed(3),
+          medianMs: setStats.medianMs.toFixed(3),
+          p95Ms: setStats.p95Ms.toFixed(3)
+        },
+        getOperations: {
+          avgMs: getStats.avgMs.toFixed(3),
+          minMs: getStats.minMs.toFixed(3),
+          maxMs: getStats.maxMs.toFixed(3),
+          medianMs: getStats.medianMs.toFixed(3),
+          p95Ms: getStats.p95Ms.toFixed(3)
+        },
+        redisStats: redisService.getStats()
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-    
-    const setStats = calculateStats(setTimings);
-    const getStats = calculateStats(getTimings);
-    
-    res.json({
-      success: true,
-      iterations,
-      setOperations: {
-        avgMs: setStats.avgMs.toFixed(3),
-        minMs: setStats.minMs.toFixed(3),
-        maxMs: setStats.maxMs.toFixed(3),
-        medianMs: setStats.medianMs.toFixed(3),
-        p95Ms: setStats.p95Ms.toFixed(3)
-      },
-      getOperations: {
-        avgMs: getStats.avgMs.toFixed(3),
-        minMs: getStats.minMs.toFixed(3),
-        maxMs: getStats.maxMs.toFixed(3),
-        medianMs: getStats.medianMs.toFixed(3),
-        p95Ms: getStats.p95Ms.toFixed(3)
-      },
-      redisStats: redisService.getStats()
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
   }
-});
+);
 
 /**
  * Test endpoint: Database query with connection pooling
  * Shows database performance with and without Redis cache
  */
-app.get('/api/test/db-query', async (req: Request, res: Response) => {
-  const useCache = req.query.cache !== 'false';
-  const iterations = parseInt(req.query.iterations as string) || 1;
-  const cacheKey = 'test:db:current-time';
-  
-  const timings: bigint[] = [];
-  let source: 'cache' | 'database' = 'database';
-  let lastResult: any = null;
-  
-  try {
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
-      
-      if (useCache) {
-        // Try cache first
-        const cached = await redisService.get(cacheKey);
-        if (cached.value !== null) {
-          lastResult = JSON.parse(cached.value);
-          source = 'cache';
-          timings.push(timer.stop());
-          continue;
+app.get(
+  '/api/test/db-query',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateQuery({
+    allowedFields: ['cache', 'iterations'],
+    validators: [validateDbQueryParams],
+  }),
+  async (req: Request, res: Response) => {
+    const useCache = req.query.cache !== 'false';
+    const iterations = parseInt(req.query.iterations as string) || 1;
+    const cacheKey = 'test:db:current-time';
+
+    const timings: bigint[] = [];
+    let source: 'cache' | 'database' = 'database';
+    let lastResult: any = null;
+
+    try {
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
+
+        if (useCache) {
+          // Try cache first
+          const cached = await redisService.get(cacheKey);
+          if (cached.value !== null) {
+            lastResult = JSON.parse(cached.value);
+            source = 'cache';
+            timings.push(timer.stop());
+            continue;
+          }
         }
+
+        // Query database
+        const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
+        lastResult = dbResult.result.rows[0];
+        source = 'database';
+
+        // Cache the result
+        if (useCache) {
+          await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
+        }
+
+        timings.push(timer.stop());
       }
-      
-      // Query database
-      const dbResult = await dbService.query('SELECT NOW() as current_time, pg_database_size(current_database()) as db_size');
-      lastResult = dbResult.result.rows[0];
-      source = 'database';
-      
-      // Cache the result
-      if (useCache) {
-        await redisService.set(cacheKey, JSON.stringify(lastResult), 30);
-      }
-      
-      timings.push(timer.stop());
+
+      const stats = calculateStats(timings);
+
+      res.json({
+        success: true,
+        iterations,
+        cacheEnabled: useCache,
+        source,
+        data: lastResult,
+        timing: {
+          avgMs: stats.avgMs.toFixed(3),
+          minMs: stats.minMs.toFixed(3),
+          maxMs: stats.maxMs.toFixed(3),
+          medianMs: stats.medianMs.toFixed(3),
+          p95Ms: stats.p95Ms.toFixed(3)
+        },
+        stats: {
+          redis: redisService.getStats(),
+          database: dbService.getStats()
+        }
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-    
-    const stats = calculateStats(timings);
-    
-    res.json({
-      success: true,
-      iterations,
-      cacheEnabled: useCache,
-      source,
-      data: lastResult,
-      timing: {
-        avgMs: stats.avgMs.toFixed(3),
-        minMs: stats.minMs.toFixed(3),
-        maxMs: stats.maxMs.toFixed(3),
-        medianMs: stats.medianMs.toFixed(3),
-        p95Ms: stats.p95Ms.toFixed(3)
-      },
-      stats: {
-        redis: redisService.getStats(),
-        database: dbService.getStats()
-      }
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  });
 
 /**
  * Test endpoint: Compare cached vs uncached database queries
  * This clearly demonstrates the performance improvement
  */
-app.get('/api/test/db-comparison', async (req: Request, res: Response) => {
-  const iterations = parseInt(req.query.iterations as string) || 10;
-  const cacheKey = 'test:db:comparison';
-  
-  // Clear any existing cache
-  await redisService.del(cacheKey);
-  
-  const uncachedTimings: bigint[] = [];
-  const cachedTimings: bigint[] = [];
-  
-  try {
-    // Run uncached queries
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
-      await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
-      uncachedTimings.push(timer.stop());
+app.get(
+  '/api/test/db-comparison',
+  validateHeaders({ allowedFields: ['authorization', 'x-request-id', 'x-api-key'] }),
+  validateQuery({
+    allowedFields: ['iterations'],
+    validators: [validateDbComparisonQueryParams],
+  }),
+  async (req: Request, res: Response) => {
+    const iterations = parseInt(req.query.iterations as string) || 10;
+    const cacheKey = 'test:db:comparison';
+
+    // Clear any existing cache
+    await redisService.del(cacheKey);
+
+    const uncachedTimings: bigint[] = [];
+    const cachedTimings: bigint[] = [];
+
+    try {
+      // Run uncached queries
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
+        await dbService.query('SELECT NOW() as ts, $1 as iteration', [i]);
+        uncachedTimings.push(timer.stop());
+      }
+
+      // Prime the cache with first query
+      const primeTimer = new Timer();
+      const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
+      await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
+      const primeTime = primeTimer.stop();
+
+      // Run cached queries
+      for (let i = 0; i < iterations; i++) {
+        const timer = new Timer();
+        await redisService.get(cacheKey);
+        cachedTimings.push(timer.stop());
+      }
+
+      const uncachedStats = calculateStats(uncachedTimings);
+      const cachedStats = calculateStats(cachedTimings);
+
+      // Calculate improvement
+      const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
+      const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
+
+      res.json({
+        success: true,
+        iterations,
+        uncached: {
+          avgMs: uncachedStats.avgMs.toFixed(3),
+          minMs: uncachedStats.minMs.toFixed(3),
+          maxMs: uncachedStats.maxMs.toFixed(3),
+          medianMs: uncachedStats.medianMs.toFixed(3),
+          p95Ms: uncachedStats.p95Ms.toFixed(3)
+        },
+        cached: {
+          avgMs: cachedStats.avgMs.toFixed(3),
+          minMs: cachedStats.minMs.toFixed(3),
+          maxMs: cachedStats.maxMs.toFixed(3),
+          medianMs: cachedStats.medianMs.toFixed(3),
+          p95Ms: cachedStats.p95Ms.toFixed(3)
+        },
+        improvement: {
+          factor: improvementFactor.toFixed(2) + 'x faster',
+          percentReduction: improvementPercent.toFixed(1) + '%',
+          absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
+        },
+        cacheSetupTimeMs: formatDuration(primeTime)
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-    
-    // Prime the cache with first query
-    const primeTimer = new Timer();
-    const result = await dbService.query('SELECT NOW() as ts, \'cached\' as type');
-    await redisService.set(cacheKey, JSON.stringify(result.result.rows[0]), 60);
-    const primeTime = primeTimer.stop();
-    
-    // Run cached queries
-    for (let i = 0; i < iterations; i++) {
-      const timer = new Timer();
-      await redisService.get(cacheKey);
-      cachedTimings.push(timer.stop());
-    }
-    
-    const uncachedStats = calculateStats(uncachedTimings);
-    const cachedStats = calculateStats(cachedTimings);
-    
-    // Calculate improvement
-    const improvementFactor = uncachedStats.avgMs / Math.max(cachedStats.avgMs, 0.001);
-    const improvementPercent = ((uncachedStats.avgMs - cachedStats.avgMs) / uncachedStats.avgMs) * 100;
-    
-    res.json({
-      success: true,
-      iterations,
-      uncached: {
-        avgMs: uncachedStats.avgMs.toFixed(3),
-        minMs: uncachedStats.minMs.toFixed(3),
-        maxMs: uncachedStats.maxMs.toFixed(3),
-        medianMs: uncachedStats.medianMs.toFixed(3),
-        p95Ms: uncachedStats.p95Ms.toFixed(3)
-      },
-      cached: {
-        avgMs: cachedStats.avgMs.toFixed(3),
-        minMs: cachedStats.minMs.toFixed(3),
-        maxMs: cachedStats.maxMs.toFixed(3),
-        medianMs: cachedStats.medianMs.toFixed(3),
-        p95Ms: cachedStats.p95Ms.toFixed(3)
-      },
-      improvement: {
-        factor: improvementFactor.toFixed(2) + 'x faster',
-        percentReduction: improvementPercent.toFixed(1) + '%',
-        absoluteSavingMs: (uncachedStats.avgMs - cachedStats.avgMs).toFixed(3)
-      },
-      cacheSetupTimeMs: formatDuration(primeTime)
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  });
 
 /**
  * Test endpoint: Get connection pool statistics
@@ -1021,9 +1155,9 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
     redisService.isHealthy(),
     dbService.isHealthy()
   ]);
-  
+
   const status = redisHealthy && dbHealthy ? 'healthy' : 'degraded';
-  
+
   res.status(status === 'healthy' ? 200 : 503).json({
     status,
     services: {
@@ -1040,7 +1174,7 @@ app.get('/api/test/health', async (req: Request, res: Response) => {
 
 // Catch-all for unhandled routes
 app.use((req: Request, res: Response) => {
-  logger.warn( `Unhandled route: ${req.method} ${req.path}`);
+  logger.warn(`Unhandled route: ${req.method} ${req.path}`);
   res.status(404).json({
     error: 'Not found',
     path: req.path,
@@ -1050,12 +1184,12 @@ app.use((req: Request, res: Response) => {
 
 // Add unhandled error handlers
 process.on('uncaughtException', (error) => {
-  logger.error( 'Uncaught Exception:', error);
+  logger.error('Uncaught Exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error( 'Unhandled Rejection at: ' + promise + ' reason: ' + reason);
+  logger.error('Unhandled Rejection at: ' + promise + ' reason: ' + reason);
 });
 
 // WebSocket proxy for Socket.IO - route to realtime gateway
@@ -1064,7 +1198,7 @@ process.on('unhandledRejection', (reason, promise) => {
 let socketIoProxy: ReturnType<typeof createProxyMiddleware> | null = null;
 
 const realtimeUrl = SERVICES.realtime;
-logger.info( 'Checking realtime service URL:', {
+logger.info('Checking realtime service URL:', {
   url: realtimeUrl,
   type: typeof realtimeUrl,
   isEmpty: realtimeUrl === '',
@@ -1075,29 +1209,29 @@ logger.info( 'Checking realtime service URL:', {
 
 if (realtimeUrl && typeof realtimeUrl === 'string' && realtimeUrl.trim() !== '') {
   try {
-    logger.info( `Initializing Socket.IO proxy to: ${realtimeUrl}`);
+    logger.info(`Initializing Socket.IO proxy to: ${realtimeUrl}`);
     socketIoProxy = createProxyMiddleware({
       target: realtimeUrl.trim(),
       changeOrigin: true,
       ws: true, // Enable WebSocket proxying
       logLevel: 'info',
       onProxyReqWs: (_proxyReq: any, req: any) => {
-        logger.info( `Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
+        logger.info(`Socket.IO WS proxy req -> ${realtimeUrl}: ${req.url}`);
       },
       onError: (err: Error, req: express.Request, res: express.Response) => {
-        logger.error( 'Socket.IO proxy error:', err.message);
+        logger.error('Socket.IO proxy error:', err.message);
         if (!res.headersSent) {
           res.status(503).json({ error: 'Realtime service unavailable' });
         }
       }
     } as any);
-    logger.info( 'Socket.IO proxy initialized successfully');
+    logger.info('Socket.IO proxy initialized successfully');
   } catch (error: any) {
-    logger.error( 'Failed to create Socket.IO proxy:', error.message);
+    logger.error('Failed to create Socket.IO proxy:', error.message);
     socketIoProxy = null;
   }
 } else {
-  logger.warn( 'REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
+  logger.warn('REALTIME_GATEWAY_URL not configured or invalid, Socket.IO proxy disabled', {
     realtimeUrl,
     envVar: process.env.REALTIME_GATEWAY_URL
   });
@@ -1110,7 +1244,7 @@ if (socketIoProxy) {
   // Handle WebSocket upgrade requests
   httpServer.on('upgrade', (req, socket: Socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.info( `WebSocket upgrade request: ${req.url}`);
+      logger.info(`WebSocket upgrade request: ${req.url}`);
       (socketIoProxy as any).upgrade(req, socket as any, head);
     } else {
       socket.destroy();
@@ -1120,7 +1254,7 @@ if (socketIoProxy) {
   // If Socket.IO proxy is not configured, handle WebSocket requests gracefully
   httpServer.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/socket.io')) {
-      logger.warn( 'WebSocket upgrade requested but realtime service not configured');
+      logger.warn('WebSocket upgrade requested but realtime service not configured');
       socket.destroy();
     } else {
       socket.destroy();
@@ -1129,13 +1263,13 @@ if (socketIoProxy) {
 }
 
 httpServer.listen(PORT, () => {
-  logger.info( `API Gateway running on port ${PORT}`);
-  logger.info( 'Proxying to services:', SERVICES);
-  logger.info( 'WebSocket support enabled for Socket.IO -> realtime gateway');
+  logger.info(`API Gateway running on port ${PORT}`);
+  logger.info('Proxying to services:', SERVICES);
+  logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
 }).on('error', (error: any) => {
-  logger.error( 'Server error:', error);
+  logger.error('Server error:', error);
   if (error.code === 'EADDRINUSE') {
-    logger.error( `Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
+    logger.error(`Port ${PORT} is already in use. Please stop the other service or change the PORT.`);
     process.exit(1);
   }
 });
