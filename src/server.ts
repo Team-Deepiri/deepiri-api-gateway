@@ -85,12 +85,12 @@ interface ServiceUrls {
 // Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
-  truss: firstDefined(process.env.TRUSS_URL, process.env.WORKFLOW_ORCHESTRATOR_URL, process.env.TASK_ORCHESTRATOR_URL) || 'http://truss:5002',
-  registry: firstDefined(process.env.REGISTRY_URL, process.env.INCENTIVE_ENGINE_URL, process.env.ENGAGEMENT_SERVICE_URL) || 'http://registry:5003',
-  telemetry: firstDefined(process.env.TELEMETRY_URL, process.env.DECISION_INTELLIGENCE_URL, process.env.PLATFORM_ANALYTICS_SERVICE_URL) || 'http://telemetry:5004',
-  notification: firstDefined(process.env.MESSAGING_SERVICE_URL, process.env.COMMUNICATIONS_HUB_URL, process.env.NOTIFICATION_SERVICE_URL) || 'http://messaging-service:5009',
+  truss: process.env.TRUSS_URL || 'http://truss:5002',
+  registry: process.env.REGISTRY_URL || 'http://registry:5003',
+  telemetry: process.env.TELEMETRY_URL || 'http://telemetry:5004',
+  notification: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
-  jobs: firstDefined(process.env.JOBS_URL, process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://jobs:5007',
+  jobs: process.env.JOBS_URL || 'http://jobs:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
@@ -446,10 +446,8 @@ const serviceBuckets: Record<string, TokenBucket> = Object.fromEntries(
 const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
   { prefix: "/api/auth", name: "auth", bucket: authTokenBucket },
   { prefix: "/api/truss", name: "truss", bucket: serviceBuckets.truss },
-  { prefix: "/api/tasks", name: "truss", bucket: serviceBuckets.truss },
   { prefix: "/api/registry", name: "registry", bucket: serviceBuckets.registry },
   { prefix: "/api/telemetry", name: "telemetry", bucket: serviceBuckets.telemetry },
-  { prefix: "/api/analytics", name: "telemetry", bucket: serviceBuckets.telemetry },
   { prefix: "/api/jobs", name: "jobs", bucket: serviceBuckets.jobs },
   { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
   { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
@@ -868,10 +866,8 @@ app.use(
 );
 
 app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
-app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss, { '^/': '/tasks/' })));
 app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
-app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs)));
 app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
