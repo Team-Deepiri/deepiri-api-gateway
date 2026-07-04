@@ -74,7 +74,6 @@ interface ServiceUrls {
   registry: string;
   telemetry: string;
   jobs: string;
-  notification: string;
   integration: string;
   realtime: string;
   messaging: string;
@@ -88,7 +87,6 @@ const SERVICES: ServiceUrls = {
   truss: process.env.TRUSS_URL || 'http://truss:5002',
   registry: process.env.REGISTRY_URL || 'http://registry:5003',
   telemetry: process.env.TELEMETRY_URL || 'http://telemetry:5004',
-  notification: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
   jobs: process.env.JOBS_URL || 'http://jobs:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
@@ -99,7 +97,7 @@ const SERVICES: ServiceUrls = {
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'truss', 'registry', 'telemetry', 'notification', 'integration', 'jobs', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'truss', 'registry', 'telemetry', 'integration', 'jobs', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
@@ -149,7 +147,6 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
     truss: 'TRUSS_URL',
     registry: 'REGISTRY_URL',
     telemetry: 'TELEMETRY_URL',
-    notification: 'MESSAGING_SERVICE_URL',
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
     jobs: 'JOBS_URL',
     realtime: 'REALTIME_GATEWAY_URL',
@@ -167,7 +164,6 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
     truss: 'http://truss:5002',
     registry: 'http://registry:5003',
     telemetry: 'http://telemetry:5004',
-    notification: 'http://messaging-service:5009',
     integration: 'http://external-bridge-service:5006',
     jobs: 'http://jobs:5007',
     realtime: 'http://realtime-gateway:5008',
@@ -432,7 +428,7 @@ const SERVICE_SPECS: Record<string, BucketSpec> = {
   truss: { capacity: 30, refillRate: 5 },
   telemetry: { capacity: 25, refillRate: 3 },
   realtime: { capacity: 40, refillRate: 8 },
-  notification: { capacity: 35, refillRate: 6 },
+  messaging: { capacity: 35, refillRate: 6 },
   integration: { capacity: 20, refillRate: 2 },
   jobs: { capacity: 25, refillRate: 4 },
   registry: { capacity: 30, refillRate: 5 },
@@ -450,7 +446,7 @@ const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
   { prefix: "/api/telemetry", name: "telemetry", bucket: serviceBuckets.telemetry },
   { prefix: "/api/jobs", name: "jobs", bucket: serviceBuckets.jobs },
   { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
-  { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
+  { prefix: "/api/notifications", name: "messaging", bucket: serviceBuckets.messaging },
   { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
   { prefix: "/api/agent", name: "cyrex", bucket: serviceBuckets.cyrex },
 ];
