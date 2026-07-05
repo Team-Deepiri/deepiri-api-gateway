@@ -868,7 +868,8 @@ app.use(
 );
 
 app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
-app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss)));
+// /api/tasks is the task-resource alias: map gateway paths onto truss /tasks/* routes.
+app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss, { '^/': '/tasks/' })));
 app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.telemetry)));
