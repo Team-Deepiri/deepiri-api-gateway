@@ -868,7 +868,7 @@ app.use(
 );
 
 app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
-app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss, { '^/': '/tasks/' })));
+app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss)));
 app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.telemetry)));
