@@ -74,7 +74,6 @@ interface ServiceUrls {
   registry: string;
   telemetry: string;
   jobs: string;
-  notification: string;
   integration: string;
   realtime: string;
   messaging: string;
@@ -85,12 +84,11 @@ interface ServiceUrls {
 // Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
-  truss: firstDefined(process.env.TRUSS_URL, process.env.WORKFLOW_ORCHESTRATOR_URL, process.env.TASK_ORCHESTRATOR_URL) || 'http://truss:5002',
-  registry: firstDefined(process.env.REGISTRY_URL, process.env.INCENTIVE_ENGINE_URL, process.env.ENGAGEMENT_SERVICE_URL) || 'http://registry:5003',
-  telemetry: firstDefined(process.env.TELEMETRY_URL, process.env.DECISION_INTELLIGENCE_URL, process.env.PLATFORM_ANALYTICS_SERVICE_URL) || 'http://telemetry:5004',
-  notification: firstDefined(process.env.MESSAGING_SERVICE_URL, process.env.COMMUNICATIONS_HUB_URL, process.env.NOTIFICATION_SERVICE_URL) || 'http://messaging-service:5009',
+  truss: process.env.TRUSS_URL || 'http://truss:5002',
+  registry: process.env.REGISTRY_URL || 'http://registry:5003',
+  telemetry: process.env.TELEMETRY_URL || 'http://telemetry:5004',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
-  jobs: firstDefined(process.env.JOBS_URL, process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://jobs:5007',
+  jobs: process.env.JOBS_URL || 'http://jobs:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
@@ -99,7 +97,7 @@ const SERVICES: ServiceUrls = {
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'truss', 'registry', 'telemetry', 'notification', 'integration', 'jobs', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'truss', 'registry', 'telemetry', 'integration', 'jobs', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
@@ -149,7 +147,6 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
     truss: 'TRUSS_URL',
     registry: 'REGISTRY_URL',
     telemetry: 'TELEMETRY_URL',
-    notification: 'MESSAGING_SERVICE_URL',
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
     jobs: 'JOBS_URL',
     realtime: 'REALTIME_GATEWAY_URL',
@@ -167,7 +164,6 @@ const getDefaultUrl = (service: keyof ServiceUrls): string => {
     truss: 'http://truss:5002',
     registry: 'http://registry:5003',
     telemetry: 'http://telemetry:5004',
-    notification: 'http://messaging-service:5009',
     integration: 'http://external-bridge-service:5006',
     jobs: 'http://jobs:5007',
     realtime: 'http://realtime-gateway:5008',
@@ -432,7 +428,7 @@ const SERVICE_SPECS: Record<string, BucketSpec> = {
   truss: { capacity: 30, refillRate: 5 },
   telemetry: { capacity: 25, refillRate: 3 },
   realtime: { capacity: 40, refillRate: 8 },
-  notification: { capacity: 35, refillRate: 6 },
+  messaging: { capacity: 35, refillRate: 6 },
   integration: { capacity: 20, refillRate: 2 },
   jobs: { capacity: 25, refillRate: 4 },
   registry: { capacity: 30, refillRate: 5 },
@@ -446,13 +442,11 @@ const serviceBuckets: Record<string, TokenBucket> = Object.fromEntries(
 const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
   { prefix: "/api/auth", name: "auth", bucket: authTokenBucket },
   { prefix: "/api/truss", name: "truss", bucket: serviceBuckets.truss },
-  { prefix: "/api/tasks", name: "truss", bucket: serviceBuckets.truss },
   { prefix: "/api/registry", name: "registry", bucket: serviceBuckets.registry },
   { prefix: "/api/telemetry", name: "telemetry", bucket: serviceBuckets.telemetry },
-  { prefix: "/api/analytics", name: "telemetry", bucket: serviceBuckets.telemetry },
   { prefix: "/api/jobs", name: "jobs", bucket: serviceBuckets.jobs },
   { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
-  { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
+  { prefix: "/api/notifications", name: "messaging", bucket: serviceBuckets.messaging },
   { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
   { prefix: "/api/agent", name: "cyrex", bucket: serviceBuckets.cyrex },
 ];
@@ -868,11 +862,8 @@ app.use(
 );
 
 app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
-// /api/tasks is the task-resource alias: map gateway paths onto truss /tasks/* routes.
-app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.truss, { '^/': '/tasks/' })));
 app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
-app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs)));
 app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
