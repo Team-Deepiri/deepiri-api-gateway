@@ -867,7 +867,7 @@ app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { 
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/jobs/' })));
 app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/queues/' })));
-app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging)));
+app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
