@@ -445,6 +445,7 @@ const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
   { prefix: "/api/registry", name: "registry", bucket: serviceBuckets.registry },
   { prefix: "/api/telemetry", name: "telemetry", bucket: serviceBuckets.telemetry },
   { prefix: "/api/jobs", name: "jobs", bucket: serviceBuckets.jobs },
+  { prefix: "/api/queues", name: "jobs", bucket: serviceBuckets.jobs },
   { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
   { prefix: "/api/notifications", name: "messaging", bucket: serviceBuckets.messaging },
   { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
@@ -864,7 +865,8 @@ app.use(
 app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
 app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
-app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs)));
+app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/jobs/' })));
+app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/queues/' })));
 app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
