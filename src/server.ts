@@ -876,8 +876,13 @@ app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createPr
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
-app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
-app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
+// language-intelligence-service's own authenticate() middleware CAN verify a
+// JWT itself, but only when AUTH_ENABLED=true -- which defaults to false, so
+// by default it falls through to the same trust-the-header pattern messaging
+// had. Verify here too so these routes are safe regardless of that service's
+// own config.
+app.use('/api/leases', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
+app.use('/api/contracts', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
 app.use('/api/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
 app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
