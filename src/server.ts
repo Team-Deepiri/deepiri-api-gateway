@@ -16,6 +16,7 @@ import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
+import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import {
   validateBody,
   validateHeaders,
@@ -867,13 +868,22 @@ app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { 
 app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
 app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/jobs/' })));
 app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/queues/' })));
-app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
+// Messaging routes carry per-user identity (chat/message/notification
+// ownership) via x-user-id -- verify the caller's JWT here and inject a
+// trusted x-user-id rather than letting messaging-service's authenticate()
+// trust whatever header a client sends directly.
+app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
-app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
+app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
-app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
-app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
-app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
+// language-intelligence-service's own authenticate() middleware CAN verify a
+// JWT itself, but only when AUTH_ENABLED=true -- which defaults to false, so
+// by default it falls through to the same trust-the-header pattern messaging
+// had. Verify here too so these routes are safe regardless of that service's
+// own config.
+app.use('/api/leases', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
+app.use('/api/contracts', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
+app.use('/api/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
 app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
