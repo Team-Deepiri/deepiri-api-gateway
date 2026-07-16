@@ -16,6 +16,7 @@ import * as dbService from './services/dbService';
 import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
+import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import {
   validateBody,
   validateHeaders,
@@ -70,12 +71,11 @@ const firstDefined = (...values: Array<string | undefined>): string | undefined 
 
 interface ServiceUrls {
   auth: string;
-  task: string;
-  engagement: string;
-  analytics: string;
-  notification: string;
+  truss: string;
+  registry: string;
+  telemetry: string;
+  jobs: string;
   integration: string;
-  challenge: string;
   realtime: string;
   messaging: string;
   cyrex: string;
@@ -85,39 +85,36 @@ interface ServiceUrls {
 // Service URLs with validation
 const SERVICES: ServiceUrls = {
   auth: process.env.AUTH_SERVICE_URL || 'http://auth-service:5001',
-  task: firstDefined(process.env.WORKFLOW_ORCHESTRATOR_URL, process.env.TASK_ORCHESTRATOR_URL) || 'http://workflow-orchestrator:5002',
-  engagement: firstDefined(process.env.INCENTIVE_ENGINE_URL, process.env.ENGAGEMENT_SERVICE_URL) || 'http://incentive-engine:5003',
-  analytics: firstDefined(process.env.DECISION_INTELLIGENCE_URL, process.env.PLATFORM_ANALYTICS_SERVICE_URL) || 'http://decision-intelligence:5004',
-  notification: firstDefined(process.env.COMMUNICATIONS_HUB_URL, process.env.NOTIFICATION_SERVICE_URL) || 'http://communications-hub:5005',
+  truss: process.env.TRUSS_URL || 'http://truss:5002',
+  registry: process.env.REGISTRY_URL || 'http://registry:5003',
+  telemetry: process.env.TELEMETRY_URL || 'http://telemetry:5004',
   integration: process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006',
-  challenge: firstDefined(process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL, process.env.CHALLENGE_SERVICE_URL) || 'http://adaptive-experience-engine:5007',
+  jobs: process.env.JOBS_URL || 'http://jobs:5007',
   realtime: process.env.REALTIME_GATEWAY_URL || 'http://realtime-gateway:5008',
   messaging: process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009',
   cyrex: process.env.CYREX_URL || 'http://cyrex:8000',
-  languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5003',
+  languageIntelligence: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5010',
 };
 
 // Validate all service URLs are defined
 const validateServiceUrls = () => {
-  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'task', 'engagement', 'analytics', 'notification', 'integration', 'challenge', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
+  const requiredServices: (keyof ServiceUrls)[] = ['auth', 'truss', 'registry', 'telemetry', 'integration', 'jobs', 'realtime', 'messaging', 'cyrex', 'languageIntelligence'];
   const missingServices: string[] = [];
 
   // Log environment variables for debugging
   logger.info('Environment variables check:', {
     AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL,
+    TRUSS_URL: process.env.TRUSS_URL,
     WORKFLOW_ORCHESTRATOR_URL: process.env.WORKFLOW_ORCHESTRATOR_URL,
-    TASK_ORCHESTRATOR_URL: process.env.TASK_ORCHESTRATOR_URL,
+    REGISTRY_URL: process.env.REGISTRY_URL,
     INCENTIVE_ENGINE_URL: process.env.INCENTIVE_ENGINE_URL,
-    ENGAGEMENT_SERVICE_URL: process.env.ENGAGEMENT_SERVICE_URL,
+    TELEMETRY_URL: process.env.TELEMETRY_URL,
     DECISION_INTELLIGENCE_URL: process.env.DECISION_INTELLIGENCE_URL,
-    PLATFORM_ANALYTICS_SERVICE_URL: process.env.PLATFORM_ANALYTICS_SERVICE_URL,
-    COMMUNICATIONS_HUB_URL: process.env.COMMUNICATIONS_HUB_URL,
-    NOTIFICATION_SERVICE_URL: process.env.NOTIFICATION_SERVICE_URL,
-    EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
-    ADAPTIVE_EXPERIENCE_ENGINE_URL: process.env.ADAPTIVE_EXPERIENCE_ENGINE_URL,
-    CHALLENGE_SERVICE_URL: process.env.CHALLENGE_SERVICE_URL,
-    REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
+    JOBS_URL: process.env.JOBS_URL,
     MESSAGING_SERVICE_URL: process.env.MESSAGING_SERVICE_URL,
+    COMMUNICATIONS_HUB_URL: process.env.COMMUNICATIONS_HUB_URL,
+    EXTERNAL_BRIDGE_SERVICE_URL: process.env.EXTERNAL_BRIDGE_SERVICE_URL,
+    REALTIME_GATEWAY_URL: process.env.REALTIME_GATEWAY_URL,
     CYREX_URL: process.env.CYREX_URL,
     LANGUAGE_INTELLIGENCE_SERVICE_URL: process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL,
   });
@@ -148,12 +145,11 @@ const validateServiceUrls = () => {
 const getEnvVarName = (service: keyof ServiceUrls): string => {
   const envMap: Record<keyof ServiceUrls, string> = {
     auth: 'AUTH_SERVICE_URL',
-    task: 'WORKFLOW_ORCHESTRATOR_URL',
-    engagement: 'INCENTIVE_ENGINE_URL',
-    analytics: 'DECISION_INTELLIGENCE_URL',
-    notification: 'COMMUNICATIONS_HUB_URL',
+    truss: 'TRUSS_URL',
+    registry: 'REGISTRY_URL',
+    telemetry: 'TELEMETRY_URL',
     integration: 'EXTERNAL_BRIDGE_SERVICE_URL',
-    challenge: 'ADAPTIVE_EXPERIENCE_ENGINE_URL',
+    jobs: 'JOBS_URL',
     realtime: 'REALTIME_GATEWAY_URL',
     messaging: 'MESSAGING_SERVICE_URL',
     cyrex: 'CYREX_URL',
@@ -166,16 +162,15 @@ const getEnvVarName = (service: keyof ServiceUrls): string => {
 const getDefaultUrl = (service: keyof ServiceUrls): string => {
   const defaults: Record<keyof ServiceUrls, string> = {
     auth: 'http://auth-service:5001',
-    task: 'http://workflow-orchestrator:5002',
-    engagement: 'http://incentive-engine:5003',
-    analytics: 'http://decision-intelligence:5004',
-    notification: 'http://communications-hub:5005',
+    truss: 'http://truss:5002',
+    registry: 'http://registry:5003',
+    telemetry: 'http://telemetry:5004',
     integration: 'http://external-bridge-service:5006',
-    challenge: 'http://adaptive-experience-engine:5007',
+    jobs: 'http://jobs:5007',
     realtime: 'http://realtime-gateway:5008',
     messaging: 'http://messaging-service:5009',
     cyrex: 'http://cyrex:8000',
-    languageIntelligence: 'http://language-intelligence-service:5003',
+    languageIntelligence: 'http://language-intelligence-service:5010',
   };
   return defaults[service];
 };
@@ -431,13 +426,13 @@ const authTokenBucket = new TokenBucket(THROTTLING_CONFIG.auth.capacity, THROTTL
 const requestQueue = new RequestQueue(THROTTLING_CONFIG.queue.maxSize, THROTTLING_CONFIG.queue.processDelay, THROTTLING_CONFIG.queue.maxWaitMs);
 
 const SERVICE_SPECS: Record<string, BucketSpec> = {
-  task: { capacity: 30, refillRate: 5 },
-  analytics: { capacity: 25, refillRate: 3 },
+  truss: { capacity: 30, refillRate: 5 },
+  telemetry: { capacity: 25, refillRate: 3 },
   realtime: { capacity: 40, refillRate: 8 },
-  notification: { capacity: 35, refillRate: 6 },
+  messaging: { capacity: 35, refillRate: 6 },
   integration: { capacity: 20, refillRate: 2 },
-  challenge: { capacity: 25, refillRate: 4 },
-  engagement: { capacity: 30, refillRate: 5 },
+  jobs: { capacity: 25, refillRate: 4 },
+  registry: { capacity: 30, refillRate: 5 },
   cyrex: { capacity: 15, refillRate: 1 },
 };
 
@@ -447,13 +442,14 @@ const serviceBuckets: Record<string, TokenBucket> = Object.fromEntries(
 
 const ROUTES: Array<{ prefix: string; name: string; bucket: TokenBucket }> = [
   { prefix: "/api/auth", name: "auth", bucket: authTokenBucket },
-  { prefix: "/api/tasks", name: "task", bucket: serviceBuckets.task },
-  { prefix: "/api/analytics", name: "analytics", bucket: serviceBuckets.analytics },
+  { prefix: "/api/truss", name: "truss", bucket: serviceBuckets.truss },
+  { prefix: "/api/registry", name: "registry", bucket: serviceBuckets.registry },
+  { prefix: "/api/telemetry", name: "telemetry", bucket: serviceBuckets.telemetry },
+  { prefix: "/api/jobs", name: "jobs", bucket: serviceBuckets.jobs },
+  { prefix: "/api/queues", name: "jobs", bucket: serviceBuckets.jobs },
   { prefix: "/api/realtime", name: "realtime", bucket: serviceBuckets.realtime },
-  { prefix: "/api/notifications", name: "notification", bucket: serviceBuckets.notification },
+  { prefix: "/api/notifications", name: "messaging", bucket: serviceBuckets.messaging },
   { prefix: "/api/integrations", name: "integration", bucket: serviceBuckets.integration },
-  { prefix: "/api/challenges", name: "challenge", bucket: serviceBuckets.challenge },
-  { prefix: "/api/gamification", name: "engagement", bucket: serviceBuckets.engagement },
   { prefix: "/api/agent", name: "cyrex", bucket: serviceBuckets.cyrex },
 ];
 
@@ -867,17 +863,27 @@ app.use(
   createProxyMiddleware(authProxyOptions)
 );
 
-app.use('/api/tasks', createProxyMiddleware(createProxy(SERVICES.task, { '^/': '/tasks/' })));
-app.use('/api/gamification', createProxyMiddleware(createProxy(SERVICES.engagement)));
-app.use('/api/analytics', createProxyMiddleware(createProxy(SERVICES.analytics)));
-app.use('/api/notifications', createProxyMiddleware(createProxy(SERVICES.notification)));
+app.use('/api/truss', createProxyMiddleware(createProxy(SERVICES.truss)));
+app.use('/api/registry', createProxyMiddleware(createProxy(SERVICES.registry, { '^/': '/api/registry/' })));
+app.use('/api/telemetry', createProxyMiddleware(createProxy(SERVICES.telemetry)));
+app.use('/api/jobs', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/jobs/' })));
+app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': '/api/queues/' })));
+// Messaging routes carry per-user identity (chat/message/notification
+// ownership) via x-user-id -- verify the caller's JWT here and inject a
+// trusted x-user-id rather than letting messaging-service's authenticate()
+// trust whatever header a client sends directly.
+app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
-app.use('/api/challenges', createProxyMiddleware(createProxy(SERVICES.challenge)));
-app.use('/api/v1/messaging', createProxyMiddleware(createProxy(SERVICES.messaging)));
+app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
-app.use('/api/leases', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
-app.use('/api/contracts', createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
-app.use('/api/messaging', createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
+// language-intelligence-service's own authenticate() middleware CAN verify a
+// JWT itself, but only when AUTH_ENABLED=true -- which defaults to false, so
+// by default it falls through to the same trust-the-header pattern messaging
+// had. Verify here too so these routes are safe regardless of that service's
+// own config.
+app.use('/api/leases', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
+app.use('/api/contracts', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
+app.use('/api/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
 app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
 app.use((err: Error, req: Request, res: Response, next: Function) => {
