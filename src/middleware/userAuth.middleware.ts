@@ -9,12 +9,13 @@ const JWT_SECRET = validateSecret('JWT_SECRET', process.env.JWT_SECRET, 32);
 
 interface DecodedToken {
   userId: string;
-  email?: string;
 }
 
 export function userAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
   // Never forward a client-supplied identity claim -- only this middleware,
-  // after verifying a real token, is allowed to set these.
+  // after verifying a real token, is allowed to set this. x-user-email is
+  // stripped but deliberately never re-set: nothing downstream reads it, so
+  // forwarding it would just be unnecessary PII exposure (least privilege).
   delete req.headers['x-user-id'];
   delete req.headers['x-user-email'];
 
@@ -41,9 +42,6 @@ export function userAuthMiddleware(req: Request, res: Response, next: NextFuncti
   }
 
   req.headers['x-user-id'] = decoded.userId;
-  if (decoded.email) {
-    req.headers['x-user-email'] = decoded.email;
-  }
 
   next();
 }
