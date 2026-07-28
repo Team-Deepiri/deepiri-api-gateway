@@ -817,7 +817,6 @@ if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
     '/api/prism/pipelines/deepiri/session',
     express.json(bodyParserConfig.json),
     createPrismSessionHandler({
-      authServiceUrl: SERVICES.auth,
       lisServiceUrl: SERVICES.languageIntelligence,
       prismpipeUrl: PRISMPIPE_URL,
     })

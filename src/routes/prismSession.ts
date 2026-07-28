@@ -1,12 +1,13 @@
 /**
- * One-RTT session bootstrap at the gateway.
+ * One-RTT session bootstrap at the gateway (fully local auth).
  *
- * Client guarantee: one hop to the gateway fans out auth verify ∥ LIS health,
- * which is always faster than two sequential client→gateway→service round-trips.
- * Results are write-through to PrismPipe so subsequent prism calls stay warm.
+ * JWT is verified in-process (same secret/claims as auth-service). Only LIS
+ * /health is a downstream hop. PrismPipe write-through is opt-in — login
+ * birth-warm already populates the shared cache.
  */
 import type { Request, Response } from 'express';
 import { createLogger } from '@team-deepiri/shared-utils';
+import { verifyLocalBearerToken } from '../auth/localJwt';
 
 const logger = createLogger('api-gateway-prism-session');
 
@@ -63,12 +64,14 @@ function normalizeAuthorization(raw: unknown): string {
   return value;
 }
 
+function writeThroughEnabled(): boolean {
+  return process.env.PRISMPIPE_SESSION_WRITE_THROUGH === 'true';
+}
+
 export function createPrismSessionHandler(opts: {
-  authServiceUrl: string;
   lisServiceUrl: string;
   prismpipeUrl?: string;
 }) {
-  const authBase = opts.authServiceUrl.replace(/\/$/, '');
   const lisBase = opts.lisServiceUrl.replace(/\/$/, '');
   const prismBase = (opts.prismpipeUrl || '').replace(/\/$/, '');
 
@@ -79,23 +82,31 @@ export function createPrismSessionHandler(opts: {
         req.headers.authorization
     );
 
-    const verifyUrl = `${authBase}/auth/verify`;
+    const jwtResult = verifyLocalBearerToken(authorization);
     const lisUrl = `${lisBase}/health`;
 
-    const [authVerify, lisHealth] = await Promise.all([
-      authorization
-        ? probeJson(verifyUrl, {
-            headers: { Authorization: authorization },
-            timeoutMs: 1500,
-          })
-        : Promise.resolve({
-            ok: false,
-            status_code: 401,
-            body: { error: 'authorization required' },
-            url: verifyUrl,
-          } as Probe),
-      probeJson(lisUrl, { timeoutMs: 800 }),
-    ]);
+    const authVerify =
+      jwtResult.ok === false
+        ? {
+            ok: false as const,
+            status_code: jwtResult.status,
+            body: { error: jwtResult.error },
+            url: 'local:jwt',
+          }
+        : {
+            ok: true as const,
+            status_code: 200,
+            body: {
+              success: true,
+              user: {
+                id: jwtResult.payload.userId,
+                email: jwtResult.payload.email,
+              },
+            },
+            url: 'local:jwt',
+          };
+
+    const lisHealth = await probeJson(lisUrl, { timeoutMs: 800 });
 
     let user: unknown = null;
     if (authVerify.ok && authVerify.body && typeof authVerify.body === 'object') {
@@ -111,21 +122,19 @@ export function createPrismSessionHandler(opts: {
       useful,
       productivity: {
         client_round_trips_saved: 1,
-        parallel_hops: ['auth.verify', 'lis.health'],
-        downstream_http_calls: 2,
-        guarantee: 'gateway_inline_one_rtt',
+        parallel_hops: ['local.jwt_verify', 'lis.health'],
+        downstream_http_calls: 1,
+        guarantee: 'gateway_local_jwt_one_rtt',
       },
     };
 
     if (!authVerify.ok) {
-      logger.warn('Inline session auth verify failed', {
-        status: authVerify.status_code,
-        url: authVerify.url,
+      logger.warn('Inline session local JWT verify failed', {
+        error: (authVerify.body as { error?: string })?.error,
       });
     }
 
-    // Write-through so PrismPipe L2/Redis stays coherent for non-gateway callers.
-    if (prismBase && authorization) {
+    if (writeThroughEnabled() && prismBase && authorization && useful) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 2000);
       void fetch(`${prismBase}/pipelines/deepiri/session`, {
@@ -149,7 +158,7 @@ export function createPrismSessionHandler(opts: {
       session,
       report: { useful, required_ok: useful },
       useful,
-      path: 'gateway_inline',
+      path: 'gateway_local_jwt',
     });
   };
 }
