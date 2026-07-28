@@ -17,6 +17,7 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
+import { createPrismSessionHandler } from './routes/prismSession';
 import {
   validateBody,
   validateHeaders,
@@ -809,6 +810,19 @@ if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
     throw new Error(`PRISMPIPE_URL is not a valid URL: ${PRISMPIPE_URL}`);
   }
   logger.info('PrismPipe proxy enabled', { target: PRISMPIPE_URL, mount: '/api/prism' });
+
+  // Session productivity path: one client RTT with inline auth∥LIS fan-out.
+  // Registered before the catch-all PrismPipe proxy.
+  app.post(
+    '/api/prism/pipelines/deepiri/session',
+    express.json(bodyParserConfig.json),
+    createPrismSessionHandler({
+      authServiceUrl: SERVICES.auth,
+      lisServiceUrl: SERVICES.languageIntelligence,
+      prismpipeUrl: PRISMPIPE_URL,
+    })
+  );
+
   app.use('/api/prism', createProxyMiddleware(createProxy(PRISMPIPE_URL)));
 } else {
   logger.info('PrismPipe proxy disabled', {
