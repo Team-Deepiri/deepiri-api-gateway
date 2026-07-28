@@ -17,7 +17,6 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
-import { createPrismSessionHandler } from './routes/prismSession';
 import {
   validateBody,
   validateHeaders,
@@ -796,39 +795,10 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
-// PrismPipe — capability-routed organism API (optional; enable via env)
-// PRISMPIPE_ENABLED must be the string "true". PRISMPIPE_URL must be an absolute
-// http(s) URL (validated below), e.g. http://deepiri-prismpipe:5011
-const PRISMPIPE_URL = (process.env.PRISMPIPE_URL || '').trim();
-const PRISMPIPE_ENABLED = process.env.PRISMPIPE_ENABLED === 'true';
-if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
-  try {
-    // Validate early so a bad env fails loudly at boot instead of at first proxy hop.
-    // eslint-disable-next-line no-new
-    new URL(PRISMPIPE_URL);
-  } catch {
-    throw new Error(`PRISMPIPE_URL is not a valid URL: ${PRISMPIPE_URL}`);
-  }
-  logger.info('PrismPipe proxy enabled', { target: PRISMPIPE_URL, mount: '/api/prism' });
-
-  // Session productivity path: one client RTT with inline auth∥LIS fan-out.
-  // Registered before the catch-all PrismPipe proxy.
-  app.post(
-    '/api/prism/pipelines/deepiri/session',
-    express.json(bodyParserConfig.json),
-    createPrismSessionHandler({
-      lisServiceUrl: SERVICES.languageIntelligence,
-      prismpipeUrl: PRISMPIPE_URL,
-    })
-  );
-
-  app.use('/api/prism', createProxyMiddleware(createProxy(PRISMPIPE_URL)));
-} else {
-  logger.info('PrismPipe proxy disabled', {
-    PRISMPIPE_ENABLED,
-    hasUrl: Boolean(PRISMPIPE_URL),
-  });
-}
+// PrismPipe is no longer a network service. It is being repurposed as a library
+// imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
+// so the gateway neither proxies to it nor owns a session fan-out handler.
+// See docs/PRISMPIPE_REPURPOSING_PLAN.md.
 
 // Auth routes — use http-proxy-middleware v3 on.* API so body re-streaming and
 // header validation are always wired correctly.
