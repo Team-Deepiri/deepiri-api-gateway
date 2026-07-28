@@ -795,6 +795,19 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
+// PrismPipe — capability-routed organism API (optional; enable via env)
+const PRISMPIPE_URL = (process.env.PRISMPIPE_URL || '').trim();
+const PRISMPIPE_ENABLED = process.env.PRISMPIPE_ENABLED === 'true';
+if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
+  logger.info('PrismPipe proxy enabled', { target: PRISMPIPE_URL, mount: '/api/prism' });
+  app.use('/api/prism', createProxyMiddleware(createProxy(PRISMPIPE_URL)));
+} else {
+  logger.info('PrismPipe proxy disabled', {
+    PRISMPIPE_ENABLED,
+    hasUrl: Boolean(PRISMPIPE_URL),
+  });
+}
+
 // Auth routes — use http-proxy-middleware v3 on.* API so body re-streaming and
 // header validation are always wired correctly.
 const authProxyOptions = {
