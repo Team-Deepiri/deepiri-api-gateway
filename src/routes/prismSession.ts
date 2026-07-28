@@ -117,8 +117,17 @@ export function createPrismSessionHandler(opts: {
       },
     };
 
+    if (!authVerify.ok) {
+      logger.warn('Inline session auth verify failed', {
+        status: authVerify.status_code,
+        url: authVerify.url,
+      });
+    }
+
     // Write-through so PrismPipe L2/Redis stays coherent for non-gateway callers.
     if (prismBase && authorization) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2000);
       void fetch(`${prismBase}/pipelines/deepiri/session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -126,11 +135,14 @@ export function createPrismSessionHandler(opts: {
           authorization,
           use_computation_sharing: true,
         }),
-      }).catch((err) => {
-        logger.warn('PrismPipe session write-through failed', {
-          error: String(err?.message || err),
-        });
-      });
+        signal: ctrl.signal,
+      })
+        .catch((err) => {
+          logger.warn('PrismPipe session write-through failed', {
+            error: String(err?.message || err),
+          });
+        })
+        .finally(() => clearTimeout(timer));
     }
 
     res.status(200).json({
