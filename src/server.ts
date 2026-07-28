@@ -799,6 +799,13 @@ app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 const PRISMPIPE_URL = (process.env.PRISMPIPE_URL || '').trim();
 const PRISMPIPE_ENABLED = process.env.PRISMPIPE_ENABLED === 'true';
 if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
+  try {
+    // Validate early so a bad env fails loudly at boot instead of at first proxy hop.
+    // eslint-disable-next-line no-new
+    new URL(PRISMPIPE_URL);
+  } catch {
+    throw new Error(`PRISMPIPE_URL is not a valid URL: ${PRISMPIPE_URL}`);
+  }
   logger.info('PrismPipe proxy enabled', { target: PRISMPIPE_URL, mount: '/api/prism' });
   app.use('/api/prism', createProxyMiddleware(createProxy(PRISMPIPE_URL)));
 } else {
