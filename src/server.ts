@@ -796,6 +796,8 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
 // PrismPipe — capability-routed organism API (optional; enable via env)
+// PRISMPIPE_ENABLED must be the string "true". PRISMPIPE_URL must be an absolute
+// http(s) URL (validated below), e.g. http://deepiri-prismpipe:5011
 const PRISMPIPE_URL = (process.env.PRISMPIPE_URL || '').trim();
 const PRISMPIPE_ENABLED = process.env.PRISMPIPE_ENABLED === 'true';
 if (PRISMPIPE_ENABLED && PRISMPIPE_URL) {
