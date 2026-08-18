@@ -795,6 +795,11 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
 app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
 
+// PrismPipe is no longer a network service. It is being repurposed as a library
+// imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
+// so the gateway neither proxies to it nor owns a session fan-out handler.
+// See docs/PRISMPIPE_REPURPOSING_PLAN.md.
+
 // Auth routes — use http-proxy-middleware v3 on.* API so body re-streaming and
 // header validation are always wired correctly.
 const authProxyOptions = {
