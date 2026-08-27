@@ -888,6 +888,11 @@ app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': 
 // own config.
 app.use('/api/leases', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/leases' })));
 app.use('/api/contracts', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/contracts' })));
+// Generic document ingestion (unified_documents) — the current primary LIS
+// ingestion path, alongside the legacy lease/contract-specific routes above.
+// Was never actually proxied here, so nothing outside the service itself
+// could reach it.
+app.use('/api/documents', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/documents' })));
 app.use('/api/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/v1/' })));
 app.use('/api/ingest', ingestionAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.languageIntelligence, { '^/': '/api/v1/ingest' })));
 // Error handling middleware for proxy errors
