@@ -789,6 +789,12 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
   }
 });
 
+// Announcements - bidirectional sync with Discord via Norozo
+// Must be mounted BEFORE generic /api proxy; provides GET/POST and webhook receiver
+import announcementsRouter from './routes/announcements';
+app.use('/api/announcements', announcementsRouter);
+app.use('/api/webhooks/norozo', announcementsRouter);
+
 // Express strips the mount path before passing to middleware
 // So '/api/auth/register' becomes '/register' when it reaches the proxy
 // PathRewrite must work with the stripped path
