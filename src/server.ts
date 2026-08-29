@@ -18,6 +18,7 @@ import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter from './routes/announcements';
+import aiRouter from './routes/ai';
 import {
   validateBody,
   validateHeaders,
@@ -862,6 +863,7 @@ const authProxyOptions = {
 
 // Announcements + Norozo webhook — must be before the /api/* proxies so body is parsed here
 app.use('/api', express.json(), announcementsRouter);
+app.use('/api/ai', express.json(), aiRouter);
 
 // Wire header validation before body validation so unknown x-* headers
 // (e.g. x-internal-secret) are rejected before the body is ever parsed.
