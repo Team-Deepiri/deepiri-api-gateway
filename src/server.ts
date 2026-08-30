@@ -794,7 +794,9 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // So '/api/auth/register' becomes '/register' when it reaches the proxy
 // PathRewrite must work with the stripped path
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
-app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
+// '/api/users/*' -> Express strips to '/*' -> rewrite to '/users/*' so it hits the
+// auth-service portal routes (GET /users, GET|PUT /users/profile, PUT /users/:id/role).
+app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth, { '^/': '/users/' })));
 
 // PrismPipe is no longer a network service. It is being repurposed as a library
 // imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
