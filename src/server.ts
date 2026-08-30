@@ -871,7 +871,7 @@ app.use(
     // their own raw-body HMAC verification downstream, so the stream must reach
     // the proxy untouched — parsing it here would leave the proxied request with
     // an empty body and break signature checks.
-    if (req.path.startsWith('/api/integrations/webhooks/')) return next();
+    if (req.path === '/api/integrations/webhooks' || req.path.startsWith('/api/integrations/webhooks/')) return next();
     return express.json({
       verify: (r: any, _res, buf) => {
         r.rawBody = buf;
