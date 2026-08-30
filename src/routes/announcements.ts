@@ -2,9 +2,8 @@ import { Router, Request, Response } from 'express';
 import { userAuthMiddleware } from '../middleware/userAuth.middleware';
 import { createLogger } from '@team-deepiri/shared-utils';
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import axios from 'axios';
+import * as dbService from '../services/dbService';
 
 const router = Router();
 const logger = createLogger('announcements');
@@ -14,6 +13,10 @@ const ANNOUNCEMENTS_WEBHOOK_SECRET =
   process.env.PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET || process.env.NOROZO_WEBHOOK_SECRET || '';
 // Norozo's inbound webhook, e.g. https://<norozo>.onrender.com/announcements/webhook
 const NOROZO_ANNOUNCEMENTS_WEBHOOK_URL = process.env.NOROZO_ANNOUNCEMENTS_WEBHOOK_URL || '';
+
+// How long a row is kept before the prune job deletes it.
+const ANNOUNCEMENTS_RETENTION_DAYS = parseInt(process.env.ANNOUNCEMENTS_RETENTION_DAYS || '30', 10);
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // check daily; deletes anything older than the retention window
 
 function signBody(rawBody: Buffer | string): string {
   const buf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf-8');
@@ -58,6 +61,17 @@ async function forwardAnnouncementToDiscord(ann: {
   }
 }
 
+interface AnnouncementRow {
+  id: string;
+  title: string;
+  body: string;
+  author_name: string | null;
+  author_id: string | null;
+  created_at: string;
+  source: 'web' | 'norozo';
+  discord_channel_id: string | null;
+}
+
 interface Announcement {
   id: string;
   title: string;
@@ -69,59 +83,104 @@ interface Announcement {
   discordChannelId?: string;
 }
 
-const STORE_PATH = process.env.ANNOUNCEMENTS_STORE_PATH || '/tmp/announcements.json';
+function toAnnouncement(row: AnnouncementRow): Announcement {
+  return {
+    id: row.id,
+    title: row.title,
+    body: row.body,
+    authorName: row.author_name ?? undefined,
+    authorId: row.author_id ?? undefined,
+    createdAt: new Date(row.created_at).toISOString(),
+    source: row.source,
+    discordChannelId: row.discord_channel_id ?? undefined,
+  };
+}
 
-// In-memory store
-let announcements: Announcement[] = [];
+// Postgres, not in-memory + a JSON file — the previous store lost every announcement's
+// history on each container recreate (which happens on every deploy), and gave no way
+// to bound how much history accumulated. api-gateway already has a pooled Postgres
+// connection (dbService) for this exact purpose; no new infra needed. Table is created
+// lazily on first use rather than via a migration tool, matching this service's existing
+// pattern (no migration framework is wired up here).
+let schemaReadyPromise: Promise<void> | null = null;
 
-function loadStore() {
+function ensureSchema(): Promise<void> {
+  if (!schemaReadyPromise) {
+    schemaReadyPromise = (async () => {
+      await dbService.query(`
+        CREATE TABLE IF NOT EXISTS announcements (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+          author_name TEXT,
+          author_id TEXT,
+          source TEXT NOT NULL,
+          discord_channel_id TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await dbService.query(`
+        CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC)
+      `);
+      const seedCheck = await dbService.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM announcements');
+      if (seedCheck.result.rows[0]?.count === '0') {
+        await dbService.query(
+          `INSERT INTO announcements (id, title, body, author_name, source) VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            'seed-1',
+            'Welcome to the new Deepiri Platform',
+            'This is the new internal hub. Check Team Meetings on your Dashboard (role-filtered), and explore Tools for Registry, Jobs, Documents, and more. Norozo will now auto-forward every post from Discord #announcements here.',
+            'Deepiri Team',
+            'web',
+          ]
+        );
+      }
+      logger.info('Announcements table ready');
+    })().catch((e: any) => {
+      // Let the next request retry schema setup instead of caching a permanent failure.
+      schemaReadyPromise = null;
+      throw e;
+    });
+  }
+  return schemaReadyPromise;
+}
+
+async function pruneOldAnnouncements(): Promise<void> {
   try {
-    if (fs.existsSync(STORE_PATH)) {
-      const raw = fs.readFileSync(STORE_PATH, 'utf-8');
-      const data = JSON.parse(raw);
-      if (Array.isArray(data)) announcements = data;
+    await ensureSchema();
+    const { result } = await dbService.query(
+      `DELETE FROM announcements WHERE created_at < now() - ($1 || ' days')::interval`,
+      [ANNOUNCEMENTS_RETENTION_DAYS]
+    );
+    if (result.rowCount) {
+      logger.info('Pruned old announcements', { deleted: result.rowCount, retentionDays: ANNOUNCEMENTS_RETENTION_DAYS });
     }
   } catch (e: any) {
-    logger.warn('Failed to load announcements store', { error: e.message });
+    logger.error('Failed to prune old announcements', { error: e.message });
   }
 }
 
-function saveStore() {
-  try {
-    const dir = path.dirname(STORE_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(STORE_PATH, JSON.stringify(announcements, null, 2));
-  } catch (e: any) {
-    logger.warn('Failed to save announcements store', { error: e.message });
-  }
-}
-
-// Seed with a welcome announcement if empty (so dashboard not blank)
-function ensureSeed() {
-  if (announcements.length === 0) {
-    announcements.push({
-      id: 'seed-1',
-      title: 'Welcome to the new Deepiri Platform',
-      body: 'This is the new internal hub. Check Team Meetings on your Dashboard (role-filtered), and explore Tools for Registry, Jobs, Documents, and more. Norozo will now auto-forward every post from Discord #announcements here.',
-      authorName: 'Deepiri Team',
-      createdAt: new Date().toISOString(),
-      source: 'web',
-    });
-    saveStore();
-  }
-}
-
-loadStore();
-ensureSeed();
+// Run once shortly after startup (DB pool needs a moment to connect) and then daily.
+setTimeout(() => void pruneOldAnnouncements(), 30_000);
+setInterval(() => void pruneOldAnnouncements(), PRUNE_INTERVAL_MS);
 
 // GET /api/announcements — list
-router.get('/announcements', (req: Request, res: Response) => {
-  const sorted = [...announcements].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  res.json({ announcements: sorted });
+router.get('/announcements', async (req: Request, res: Response) => {
+  try {
+    await ensureSchema();
+    const { result } = await dbService.query<AnnouncementRow>(
+      'SELECT * FROM announcements ORDER BY created_at DESC LIMIT 200'
+    );
+    res.json({ announcements: result.rows.map(toAnnouncement) });
+  } catch (e: any) {
+    logger.error('Failed to list announcements', { error: e.message });
+    res.status(500).json({ error: 'Failed to list announcements' });
+  }
 });
 
 // POST /api/announcements — create from web (requires auth)
-router.post('/announcements', userAuthMiddleware as any, (req: Request, res: Response) => {
+router.post('/announcements', userAuthMiddleware as any, async (req: Request, res: Response) => {
   const { title, body } = req.body || {};
   if (!title || !String(title).trim() || !body || !String(body).trim()) {
     return res.status(400).json({ error: 'Title and body are required' });
@@ -139,10 +198,18 @@ router.post('/announcements', userAuthMiddleware as any, (req: Request, res: Res
     createdAt: new Date().toISOString(),
     source: 'web',
   };
-  announcements.unshift(ann);
-  // keep last 200
-  if (announcements.length > 200) announcements = announcements.slice(0, 200);
-  saveStore();
+
+  try {
+    await ensureSchema();
+    await dbService.query(
+      `INSERT INTO announcements (id, title, body, author_name, author_id, source) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [ann.id, ann.title, ann.body, ann.authorName ?? null, ann.authorId ?? null, ann.source]
+    );
+  } catch (e: any) {
+    logger.error('Failed to store web announcement', { error: e.message });
+    return res.status(500).json({ error: 'Failed to create announcement' });
+  }
+
   logger.info('Announcement created via web', { id: ann.id, title: ann.title });
   res.status(201).json({ success: true, announcement: ann });
 
@@ -156,7 +223,7 @@ router.post('/announcements', userAuthMiddleware as any, (req: Request, res: Res
 // keyed with the secret shared via PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET — matches
 // Norozo's own _forward_announcement_to_platform() and inbound platform_announcement_handler(),
 // so both directions of the bridge use the same scheme.
-router.post('/webhooks/norozo/announcements', (req: Request, res: Response) => {
+router.post('/webhooks/norozo/announcements', async (req: Request, res: Response) => {
   const sigHeader = String(req.headers['x-norozo-signature'] || req.headers['x-platform-signature'] || '').trim();
   const rawBody: Buffer | undefined = (req as any).rawBody;
   if (!rawBody || !verifySignature(rawBody, sigHeader)) {
@@ -180,9 +247,19 @@ router.post('/webhooks/norozo/announcements', (req: Request, res: Response) => {
     source: 'norozo',
     discordChannelId: String(discordChannelId || process.env.ANNOUNCEMENTS_CHANNEL_ID || '1436509524818395156'),
   };
-  announcements.unshift(ann);
-  if (announcements.length > 200) announcements = announcements.slice(0, 200);
-  saveStore();
+
+  try {
+    await ensureSchema();
+    await dbService.query(
+      `INSERT INTO announcements (id, title, body, author_name, author_id, source, discord_channel_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [ann.id, ann.title, ann.body, ann.authorName ?? null, ann.authorId ?? null, ann.source, ann.discordChannelId ?? null]
+    );
+  } catch (e: any) {
+    logger.error('Failed to store Norozo announcement', { error: e.message });
+    return res.status(500).json({ error: 'Failed to create announcement' });
+  }
+
   logger.info('Announcement created via Norozo webhook', { id: ann.id, channelId: ann.discordChannelId });
   res.status(201).json({ success: true, announcement: ann });
 });
