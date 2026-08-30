@@ -861,7 +861,18 @@ const authProxyOptions = {
 };
 
 // Announcements + Norozo webhook — must be before the /api/* proxies so body is parsed here
-app.use('/api', express.json(), announcementsRouter);
+// verify: captures the exact raw bytes onto req.rawBody so the Norozo webhook route can
+// HMAC-verify against precisely what Norozo signed (re-serializing the parsed JSON would
+// not byte-match Python's json.dumps output and the signature would never verify).
+app.use(
+  '/api',
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+  announcementsRouter
+);
 
 // Wire header validation before body validation so unknown x-* headers
 // (e.g. x-internal-secret) are rejected before the body is ever parsed.

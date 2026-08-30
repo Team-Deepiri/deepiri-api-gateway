@@ -1,11 +1,62 @@
 import { Router, Request, Response } from 'express';
 import { userAuthMiddleware } from '../middleware/userAuth.middleware';
 import { createLogger } from '@team-deepiri/shared-utils';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
 
 const router = Router();
 const logger = createLogger('announcements');
+
+// Shared secret with Norozo's PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET / ANNOUNCEMENTS_INBOUND_SECRET.
+const ANNOUNCEMENTS_WEBHOOK_SECRET =
+  process.env.PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET || process.env.NOROZO_WEBHOOK_SECRET || '';
+// Norozo's inbound webhook, e.g. https://<norozo>.onrender.com/announcements/webhook
+const NOROZO_ANNOUNCEMENTS_WEBHOOK_URL = process.env.NOROZO_ANNOUNCEMENTS_WEBHOOK_URL || '';
+
+function signBody(rawBody: Buffer | string): string {
+  const buf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf-8');
+  return `sha256=${crypto.createHmac('sha256', ANNOUNCEMENTS_WEBHOOK_SECRET).update(buf).digest('hex')}`;
+}
+
+function verifySignature(rawBody: Buffer, signatureHeader: string): boolean {
+  if (!ANNOUNCEMENTS_WEBHOOK_SECRET || !signatureHeader) return false;
+  const expected = signBody(rawBody);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signatureHeader);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+async function forwardAnnouncementToDiscord(ann: {
+  title: string;
+  body: string;
+  authorName?: string;
+  url?: string;
+}): Promise<void> {
+  if (!NOROZO_ANNOUNCEMENTS_WEBHOOK_URL || !ANNOUNCEMENTS_WEBHOOK_SECRET) {
+    logger.warn('Skipping forward to Discord: NOROZO_ANNOUNCEMENTS_WEBHOOK_URL or shared secret not configured');
+    return;
+  }
+  const payload = {
+    title: ann.title,
+    body: ann.body,
+    author: ann.authorName || 'Platform',
+    url: ann.url || '',
+  };
+  const raw = Buffer.from(JSON.stringify(payload), 'utf-8');
+  const signature = signBody(raw);
+  try {
+    await axios.post(NOROZO_ANNOUNCEMENTS_WEBHOOK_URL, raw, {
+      headers: { 'Content-Type': 'application/json', 'X-Norozo-Signature': signature },
+      timeout: 10_000,
+    });
+    logger.info('Forwarded web announcement to Discord via Norozo');
+  } catch (e: any) {
+    logger.error('Failed to forward announcement to Discord', { error: e.message });
+  }
+}
 
 interface Announcement {
   id: string;
@@ -94,21 +145,26 @@ router.post('/announcements', userAuthMiddleware as any, (req: Request, res: Res
   saveStore();
   logger.info('Announcement created via web', { id: ann.id, title: ann.title });
   res.status(201).json({ success: true, announcement: ann });
+
+  // Bidirectional bridge: mirror web-created announcements to Discord #announcements.
+  // Fire-and-forget — don't block the API response on Discord being reachable.
+  void forwardAnnouncementToDiscord({ title: ann.title, body: ann.body, authorName: ann.authorName });
 });
 
 // POST /api/webhooks/norozo/announcements — Norozo Discord bot forwards #announcements
-// Header: X-Norozo-Secret: <NOROZO_WEBHOOK_SECRET or DISCORD_BOT_TOKEN>
+// Auth: HMAC-SHA256 over the raw request body, header X-Norozo-Signature: sha256=<hex>,
+// keyed with the secret shared via PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET — matches
+// Norozo's own _forward_announcement_to_platform() and inbound platform_announcement_handler(),
+// so both directions of the bridge use the same scheme.
 router.post('/webhooks/norozo/announcements', (req: Request, res: Response) => {
-  const secret = String(req.headers['x-norozo-secret'] || req.headers['x-norozo-token'] || '').trim();
-  const expected = String(process.env.NOROZO_WEBHOOK_SECRET || process.env.DISCORD_BOT_TOKEN || '').trim();
-  // If expected is set, enforce; if not set, allow but warn (so local dev still works)
-  if (expected && secret !== expected) {
-    logger.warn('Norozo webhook unauthorized', { hasSecret: !!secret });
-    return res.status(401).json({ error: 'Invalid Norozo secret' });
+  const sigHeader = String(req.headers['x-norozo-signature'] || req.headers['x-platform-signature'] || '').trim();
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!rawBody || !verifySignature(rawBody, sigHeader)) {
+    logger.warn('Norozo webhook unauthorized', { hasSignature: !!sigHeader });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
   }
 
-  const { title, body, content, authorName, author, channelId } = req.body || {};
-  // Norozo may send { title, body } or { content } (Discord message content)
+  const { title, body, content, author, author_id: authorId, discord_channel_id: discordChannelId } = req.body || {};
   const finalTitle = String(title || content?.slice(0, 80) || 'Discord Announcement').trim().slice(0, 200);
   const finalBody = String(body || content || '').trim();
   if (!finalBody) return res.status(400).json({ error: 'Body/content is required' });
@@ -118,10 +174,11 @@ router.post('/webhooks/norozo/announcements', (req: Request, res: Response) => {
     id: `norozo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     title: finalTitle,
     body: finalBody,
-    authorName: String(authorName || author || 'Norozo (Discord #announcements)'),
+    authorName: String(author || 'Norozo (Discord #announcements)'),
+    authorId: authorId ? String(authorId) : undefined,
     createdAt: new Date().toISOString(),
     source: 'norozo',
-    discordChannelId: String(channelId || process.env.ANNOUNCEMENTS_CHANNEL_ID || '1436509524818395156'),
+    discordChannelId: String(discordChannelId || process.env.ANNOUNCEMENTS_CHANNEL_ID || '1436509524818395156'),
   };
   announcements.unshift(ann);
   if (announcements.length > 200) announcements = announcements.slice(0, 200);
