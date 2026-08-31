@@ -17,6 +17,7 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
+import announcementsRouter from './routes/announcements';
 import {
   validateBody,
   validateHeaders,
@@ -793,7 +794,9 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // So '/api/auth/register' becomes '/register' when it reaches the proxy
 // PathRewrite must work with the stripped path
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
-app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
+// '/api/users/*' -> Express strips to '/*' -> rewrite to '/users/*' so it hits the
+// auth-service portal routes (GET /users, GET|PUT /users/profile, PUT /users/:id/role).
+app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth, { '^/': '/users/' })));
 
 // PrismPipe is no longer a network service. It is being repurposed as a library
 // imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
@@ -858,6 +861,20 @@ const authProxyOptions = {
     },
   },
 };
+
+// Announcements + Norozo webhook — must be before the /api/* proxies so body is parsed here
+// verify: captures the exact raw bytes onto req.rawBody so the Norozo webhook route can
+// HMAC-verify against precisely what Norozo signed (re-serializing the parsed JSON would
+// not byte-match Python's json.dumps output and the signature would never verify).
+app.use(
+  '/api',
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+  announcementsRouter
+);
 
 // Wire header validation before body validation so unknown x-* headers
 // (e.g. x-internal-secret) are rejected before the body is ever parsed.
