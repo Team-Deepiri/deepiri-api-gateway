@@ -415,4 +415,117 @@ router.get('/webhooks/norozo/state', async (req: Request, res: Response) => {
   }
 });
 
+// --- Norozo member emails ----------------------------------------------------
+// Self-reported at join time (Norozo DMs new members asking for it) -- a
+// dedicated table rather than folding into bot_state's generic key/value shape,
+// since this is real per-member data other things may eventually want to query
+// (e.g. "list everyone missing an email on file"), not an opaque checkpoint blob.
+// Same signed-webhook scheme as the routes above.
+
+let memberEmailSchemaReadyPromise: Promise<void> | null = null;
+
+function ensureMemberEmailSchema(): Promise<void> {
+  if (!memberEmailSchemaReadyPromise) {
+    memberEmailSchemaReadyPromise = (async () => {
+      await dbService.query(`
+        CREATE TABLE IF NOT EXISTS member_emails (
+          discord_id TEXT PRIMARY KEY,
+          discord_username TEXT,
+          email TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      logger.info('member_emails table ready');
+    })().catch((e: any) => {
+      memberEmailSchemaReadyPromise = null;
+      throw e;
+    });
+  }
+  return memberEmailSchemaReadyPromise;
+}
+
+const MEMBER_EMAIL_GET_SIGNING_PREFIX = 'GET /api/webhooks/norozo/member-email?discord_id=';
+
+// POST /api/webhooks/norozo/member-email — upsert {discord_id, discord_username, email}
+router.post('/webhooks/norozo/member-email', async (req: Request, res: Response) => {
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!rawBody || !verifySignature(rawBody, sigHeader)) {
+    logger.warn('Norozo member-email webhook unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo member-email write',
+      message: `POST /api/webhooks/norozo/member-email rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  const { discord_id: discordId, discord_username: discordUsername, email } = req.body || {};
+  const id = String(discordId || '').trim();
+  const mail = String(email || '').trim();
+  if (!id || !mail) {
+    return res.status(400).json({ error: 'discord_id and email are required' });
+  }
+  if (id.length > 32 || mail.length > 320) {
+    return res.status(400).json({ error: 'discord_id/email too long' });
+  }
+
+  try {
+    await ensureMemberEmailSchema();
+    await dbService.query(
+      `INSERT INTO member_emails (discord_id, discord_username, email, updated_at) VALUES ($1, $2, $3, now())
+       ON CONFLICT (discord_id) DO UPDATE SET email = EXCLUDED.email, discord_username = EXCLUDED.discord_username, updated_at = now()`,
+      [id, discordUsername ? String(discordUsername).slice(0, 200) : null, mail]
+    );
+  } catch (e: any) {
+    logger.error('Failed to save member_emails row', { error: e.message, discordId: id });
+    return res.status(500).json({ error: 'Failed to save member email' });
+  }
+
+  res.status(200).json({ success: true });
+});
+
+// GET /api/webhooks/norozo/member-email?discord_id=... — sign the literal query string
+// (prefix + discord_id) since there's no body to HMAC over, same approach as the
+// state GET route but parameterized per-lookup instead of a single fixed string.
+router.get('/webhooks/norozo/member-email', async (req: Request, res: Response) => {
+  const discordId = String(req.query.discord_id || '').trim();
+  if (!discordId) return res.status(400).json({ error: 'discord_id query param is required' });
+
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const expected = signBody(MEMBER_EMAIL_GET_SIGNING_PREFIX + discordId);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(sigHeader);
+  if (!sigHeader || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    logger.warn('Norozo member-email read unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo member-email read',
+      message: `GET /api/webhooks/norozo/member-email rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  try {
+    await ensureMemberEmailSchema();
+    const { result } = await dbService.query<{ email: string; discord_username: string | null; updated_at: string }>(
+      'SELECT email, discord_username, updated_at FROM member_emails WHERE discord_id = $1',
+      [discordId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({
+      discordId,
+      email: result.rows[0].email,
+      discordUsername: result.rows[0].discord_username,
+      updatedAt: result.rows[0].updated_at,
+    });
+  } catch (e: any) {
+    logger.error('Failed to read member_emails row', { error: e.message, discordId });
+    res.status(500).json({ error: 'Failed to read member email' });
+  }
+});
+
 export default router;
