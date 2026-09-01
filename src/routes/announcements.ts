@@ -23,6 +23,36 @@ function signBody(rawBody: Buffer | string): string {
   return `sha256=${crypto.createHmac('sha256', ANNOUNCEMENTS_WEBHOOK_SECRET).update(buf).digest('hex')}`;
 }
 
+// Same shared secret + host as the announcements bridge — Norozo's /alerts/webhook
+// posts security/system notifications into #it-notifications (STAFF_CHANNEL_ID on
+// Norozo's side). Fire-and-forget: alerting must never block the request that
+// triggered it, and a failed alert shouldn't surface as a 500 to the caller.
+function norozoAlertsUrl(): string {
+  if (!NOROZO_ANNOUNCEMENTS_WEBHOOK_URL) return '';
+  try {
+    const u = new URL(NOROZO_ANNOUNCEMENTS_WEBHOOK_URL);
+    return `${u.protocol}//${u.host}/alerts/webhook`;
+  } catch {
+    return '';
+  }
+}
+
+export function alertNorozo(opts: { title: string; message: string; severity?: 'critical' | 'error' | 'warning' | 'info'; service?: string }): void {
+  const url = norozoAlertsUrl();
+  if (!url || !ANNOUNCEMENTS_WEBHOOK_SECRET) return;
+  const payload = {
+    title: opts.title,
+    message: opts.message,
+    severity: opts.severity || 'warning',
+    service: opts.service || 'deepiri-api-gateway',
+  };
+  const raw = Buffer.from(JSON.stringify(payload), 'utf-8');
+  const signature = signBody(raw);
+  void axios
+    .post(url, raw, { headers: { 'Content-Type': 'application/json', 'X-Norozo-Signature': signature }, timeout: 8_000 })
+    .catch((e: any) => logger.error('Failed to forward alert to Discord #it-notifications', { error: e.message }));
+}
+
 function verifySignature(rawBody: Buffer, signatureHeader: string): boolean {
   if (!ANNOUNCEMENTS_WEBHOOK_SECRET || !signatureHeader) return false;
   const expected = signBody(rawBody);
@@ -228,6 +258,11 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
   const rawBody: Buffer | undefined = (req as any).rawBody;
   if (!rawBody || !verifySignature(rawBody, sigHeader)) {
     logger.warn('Norozo webhook unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo webhook',
+      message: `POST /api/webhooks/norozo/announcements rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+    });
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
 
@@ -262,6 +297,113 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
 
   logger.info('Announcement created via Norozo webhook', { id: ann.id, channelId: ann.discordChannelId });
   res.status(201).json({ success: true, announcement: ann });
+});
+
+// --- Norozo bot-state checkpoint -------------------------------------------------
+// Render's free-tier disk is ephemeral (wiped on every spin-down/restart), so Norozo
+// can't just write a "last online at" checkpoint to its own filesystem and expect it
+// to survive. It already has a signed webhook channel into this service (see above),
+// so reuse that same HMAC scheme + Postgres pool instead of standing up new infra.
+// Tiny generic key/value table — not announcement-specific — in case other bot state
+// needs the same durability later.
+
+let stateSchemaReadyPromise: Promise<void> | null = null;
+
+function ensureStateSchema(): Promise<void> {
+  if (!stateSchemaReadyPromise) {
+    stateSchemaReadyPromise = (async () => {
+      await dbService.query(`
+        CREATE TABLE IF NOT EXISTS bot_state (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      logger.info('bot_state table ready');
+    })().catch((e: any) => {
+      stateSchemaReadyPromise = null;
+      throw e;
+    });
+  }
+  return stateSchemaReadyPromise;
+}
+
+// GET has no body to HMAC over, so sign a fixed string instead — same secret,
+// same timing-safe comparison as the POST routes above.
+const STATE_GET_SIGNING_STRING = 'GET /api/webhooks/norozo/state';
+
+// POST /api/webhooks/norozo/state — Norozo checkpoints "last known online at" here
+// (and periodically heartbeats it) so a restart knows how far back to catch up,
+// instead of relying on 'currently open thread' as a stand-in for 'not yet handled'.
+router.post('/webhooks/norozo/state', async (req: Request, res: Response) => {
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!rawBody || !verifySignature(rawBody, sigHeader)) {
+    logger.warn('Norozo state webhook unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo state write',
+      message: `POST /api/webhooks/norozo/state rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  const { key, value } = req.body || {};
+  const stateKey = String(key || '').trim();
+  const stateValue = String(value ?? '').trim();
+  if (!stateKey || !stateValue) {
+    return res.status(400).json({ error: 'key and value are required' });
+  }
+  if (stateKey.length > 200 || stateValue.length > 4000) {
+    return res.status(400).json({ error: 'key/value too long' });
+  }
+
+  try {
+    await ensureStateSchema();
+    await dbService.query(
+      `INSERT INTO bot_state (key, value, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [stateKey, stateValue]
+    );
+  } catch (e: any) {
+    logger.error('Failed to save bot_state', { error: e.message, key: stateKey });
+    return res.status(500).json({ error: 'Failed to save state' });
+  }
+
+  res.status(200).json({ success: true });
+});
+
+// GET /api/webhooks/norozo/state?key=norozo_last_online_at
+router.get('/webhooks/norozo/state', async (req: Request, res: Response) => {
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const expected = signBody(STATE_GET_SIGNING_STRING);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(sigHeader);
+  if (!sigHeader || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    logger.warn('Norozo state read unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo state read',
+      message: `GET /api/webhooks/norozo/state rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  const stateKey = String(req.query.key || '').trim();
+  if (!stateKey) return res.status(400).json({ error: 'key query param is required' });
+
+  try {
+    await ensureStateSchema();
+    const { result } = await dbService.query<{ value: string; updated_at: string }>(
+      'SELECT value, updated_at FROM bot_state WHERE key = $1',
+      [stateKey]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({ key: stateKey, value: result.rows[0].value, updatedAt: result.rows[0].updated_at });
+  } catch (e: any) {
+    logger.error('Failed to read bot_state', { error: e.message, key: stateKey });
+    res.status(500).json({ error: 'Failed to read state' });
+  }
 });
 
 export default router;
