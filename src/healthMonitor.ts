@@ -25,18 +25,26 @@ interface ServiceTarget {
   url: string; // health endpoint, or base URL if it has none
 }
 
+// Only services actually deployed alongside this gateway (confirmed via `docker ps`
+// on the VM). The full docker-compose.yml defines more (truss, telemetry,
+// realtime-gateway, messaging-service, cyrex, language-intelligence-service) that
+// aren't running in this deployment — checking those would always report "down"
+// and spam #it-notifications / DM Security & Operations Support with false
+// criticals for services that were never started here. Setting the matching env
+// var opts a service back in once it's actually deployed.
 function httpServiceTargets(): ServiceTarget[] {
-  return [
+  const candidates: ServiceTarget[] = [
     { name: 'auth-service', url: `${process.env.AUTH_SERVICE_URL || 'http://auth-service:5001'}/health` },
-    { name: 'truss', url: `${process.env.TRUSS_URL || 'http://truss:5002'}/health` },
     { name: 'registry', url: `${process.env.REGISTRY_URL || 'http://registry:5003'}/health` },
-    { name: 'telemetry', url: `${process.env.TELEMETRY_URL || 'http://telemetry:5004'}/health` },
     { name: 'external-bridge-service', url: `${process.env.EXTERNAL_BRIDGE_SERVICE_URL || 'http://external-bridge-service:5006'}/health` },
     { name: 'jobs', url: `${process.env.JOBS_URL || 'http://jobs:5007'}/health` },
-    { name: 'messaging-service', url: `${process.env.MESSAGING_SERVICE_URL || 'http://messaging-service:5009'}/health` },
-    { name: 'cyrex', url: `${process.env.CYREX_URL || 'http://cyrex:8000'}/health` },
-    { name: 'language-intelligence-service', url: `${process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL || 'http://language-intelligence-service:5010'}/health` },
   ];
+  if (process.env.TRUSS_URL) candidates.push({ name: 'truss', url: `${process.env.TRUSS_URL}/health` });
+  if (process.env.TELEMETRY_URL) candidates.push({ name: 'telemetry', url: `${process.env.TELEMETRY_URL}/health` });
+  if (process.env.MESSAGING_SERVICE_URL) candidates.push({ name: 'messaging-service', url: `${process.env.MESSAGING_SERVICE_URL}/health` });
+  if (process.env.CYREX_URL) candidates.push({ name: 'cyrex', url: `${process.env.CYREX_URL}/health` });
+  if (process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL) candidates.push({ name: 'language-intelligence-service', url: `${process.env.LANGUAGE_INTELLIGENCE_SERVICE_URL}/health` });
+  return candidates;
 }
 
 // name -> consecutive failure count (0 = currently up)
