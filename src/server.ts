@@ -18,6 +18,7 @@ import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter from './routes/announcements';
+import { startHealthMonitor } from './healthMonitor';
 import {
   validateBody,
   validateHeaders,
@@ -1299,6 +1300,7 @@ httpServer.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
   logger.info('Proxying to services:', SERVICES);
   logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
+  startHealthMonitor();
 }).on('error', (error: any) => {
   logger.error('Server error:', error);
   if (error.code === 'EADDRINUSE') {
