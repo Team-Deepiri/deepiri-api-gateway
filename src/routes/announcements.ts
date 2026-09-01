@@ -37,7 +37,12 @@ function norozoAlertsUrl(): string {
   }
 }
 
-export function alertNorozo(opts: { title: string; message: string; severity?: 'critical' | 'error' | 'warning' | 'info'; service?: string }): void {
+const WEBHOOK_REJECTION_STEPS =
+  '1. Check the source IP above against known/expected senders (Norozo\'s Render egress, or the deepiri-proxy VPS).\n' +
+  '2. A single rejection is likely noise (a stale secret right after a redeploy, a retried request). Repeated rejections from the same IP are worth investigating as a possible probe.\n' +
+  '3. If this is legitimate traffic failing: confirm PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET matches on both sides (Render env for Norozo, and this gateway\'s env).';
+
+export function alertNorozo(opts: { title: string; message: string; severity?: 'critical' | 'error' | 'warning' | 'info'; service?: string; steps?: string }): void {
   const url = norozoAlertsUrl();
   if (!url || !ANNOUNCEMENTS_WEBHOOK_SECRET) return;
   const payload = {
@@ -45,6 +50,7 @@ export function alertNorozo(opts: { title: string; message: string; severity?: '
     message: opts.message,
     severity: opts.severity || 'warning',
     service: opts.service || 'deepiri-api-gateway',
+    steps: opts.steps,
   };
   const raw = Buffer.from(JSON.stringify(payload), 'utf-8');
   const signature = signBody(raw);
@@ -262,6 +268,7 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
       title: 'Rejected inbound Norozo webhook',
       message: `POST /api/webhooks/norozo/announcements rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
       severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
     });
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
@@ -344,6 +351,7 @@ router.post('/webhooks/norozo/state', async (req: Request, res: Response) => {
       title: 'Rejected inbound Norozo state write',
       message: `POST /api/webhooks/norozo/state rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
       severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
     });
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
@@ -385,6 +393,7 @@ router.get('/webhooks/norozo/state', async (req: Request, res: Response) => {
       title: 'Rejected inbound Norozo state read',
       message: `GET /api/webhooks/norozo/state rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
       severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
     });
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
