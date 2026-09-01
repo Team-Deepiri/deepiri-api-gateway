@@ -869,11 +869,18 @@ const authProxyOptions = {
 // not byte-match Python's json.dumps output and the signature would never verify).
 app.use(
   '/api',
-  express.json({
-    verify: (req: any, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
+  (req, res, next) => {
+    // Third-party webhook proxies (e.g. external-bridge /webhooks/:provider) do
+    // their own raw-body HMAC verification downstream, so the stream must reach
+    // the proxy untouched — parsing it here would leave the proxied request with
+    // an empty body and break signature checks.
+    if (req.path === '/api/integrations/webhooks' || req.path.startsWith('/api/integrations/webhooks/')) return next();
+    return express.json({
+      verify: (r: any, _res, buf) => {
+        r.rawBody = buf;
+      },
+    })(req, res, next);
+  },
   announcementsRouter
 );
 
@@ -896,6 +903,12 @@ app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': 
 // trusted x-user-id rather than letting messaging-service's authenticate()
 // trust whatever header a client sends directly.
 app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
+// The /github/* read API exposes team pull-request activity and must only be
+// reachable by a signed-in portal user -- verify the JWT here. Inbound webhooks
+// and OAuth callbacks under /api/integrations stay open by design (GitHub signs
+// its own deliveries), so this guard is scoped to the /github subtree only and
+// the generic proxy below still forwards the full path.
+app.use('/api/integrations/github', userAuthMiddleware);
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
