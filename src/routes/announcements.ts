@@ -528,4 +528,174 @@ router.get('/webhooks/norozo/member-email', async (req: Request, res: Response) 
   }
 });
 
+// GET /api/webhooks/norozo/member-email/by-email?email=... — reverse lookup for
+// the GitHub-PR-author -> Discord identity chain: Plaky hands back a
+// self-reported email, and this finds which Discord account reported it at
+// onboarding. Same table, same signed-GET-query-string scheme as the
+// discord_id-keyed lookup above, just a different key.
+const MEMBER_EMAIL_BY_EMAIL_GET_SIGNING_PREFIX = 'GET /api/webhooks/norozo/member-email/by-email?email=';
+
+router.get('/webhooks/norozo/member-email/by-email', async (req: Request, res: Response) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'email query param is required' });
+
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const expected = signBody(MEMBER_EMAIL_BY_EMAIL_GET_SIGNING_PREFIX + email);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(sigHeader);
+  if (!sigHeader || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    logger.warn('Norozo member-email-by-email read unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo member-email-by-email read',
+      message: `GET /api/webhooks/norozo/member-email/by-email rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  try {
+    await ensureMemberEmailSchema();
+    const { result } = await dbService.query<{ discord_id: string; discord_username: string | null; updated_at: string }>(
+      'SELECT discord_id, discord_username, updated_at FROM member_emails WHERE lower(email) = $1',
+      [email]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({
+      email,
+      discordId: result.rows[0].discord_id,
+      discordUsername: result.rows[0].discord_username,
+      updatedAt: result.rows[0].updated_at,
+    });
+  } catch (e: any) {
+    logger.error('Failed to reverse-lookup member_emails row', { error: e.message, email });
+    res.status(500).json({ error: 'Failed to read member email' });
+  }
+});
+
+// --- PR staleness tracking ----------------------------------------------------
+// Tracks which staleness tiers (2 week / 2.5 week / 1 month) have already
+// fired for a given PR, so a periodic scan never re-notifies the same tier on
+// every run. Same signed-webhook scheme as everything else above.
+
+let prStalenessSchemaReadyPromise: Promise<void> | null = null;
+
+function ensurePrStalenessSchema(): Promise<void> {
+  if (!prStalenessSchemaReadyPromise) {
+    prStalenessSchemaReadyPromise = (async () => {
+      await dbService.query(`
+        CREATE TABLE IF NOT EXISTS pr_staleness_state (
+          repo TEXT NOT NULL,
+          pr_number INTEGER NOT NULL,
+          notified_2week BOOLEAN NOT NULL DEFAULT false,
+          notified_2_5week BOOLEAN NOT NULL DEFAULT false,
+          notified_1month BOOLEAN NOT NULL DEFAULT false,
+          resolved_discord_id TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (repo, pr_number)
+        )
+      `);
+      logger.info('pr_staleness_state table ready');
+    })().catch((e: any) => {
+      prStalenessSchemaReadyPromise = null;
+      throw e;
+    });
+  }
+  return prStalenessSchemaReadyPromise;
+}
+
+// POST /api/webhooks/norozo/pr-staleness — upsert the notified-tier flags (and
+// optionally a resolved_discord_id cache) for one repo+PR.
+router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response) => {
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!rawBody || !verifySignature(rawBody, sigHeader)) {
+    logger.warn('Norozo pr-staleness webhook unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo pr-staleness write',
+      message: `POST /api/webhooks/norozo/pr-staleness rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  const { repo, pr_number: prNumber, notified_2week, notified_2_5week, notified_1month, resolved_discord_id: resolvedDiscordId } = req.body || {};
+  const repoStr = String(repo || '').trim();
+  const num = Number(prNumber);
+  if (!repoStr || !Number.isInteger(num)) {
+    return res.status(400).json({ error: 'repo and integer pr_number are required' });
+  }
+  if (repoStr.length > 200) return res.status(400).json({ error: 'repo too long' });
+
+  try {
+    await ensurePrStalenessSchema();
+    await dbService.query(
+      `INSERT INTO pr_staleness_state (repo, pr_number, notified_2week, notified_2_5week, notified_1month, resolved_discord_id, updated_at)
+       VALUES ($1, $2, COALESCE($3, false), COALESCE($4, false), COALESCE($5, false), $6, now())
+       ON CONFLICT (repo, pr_number) DO UPDATE SET
+         notified_2week = COALESCE($3, pr_staleness_state.notified_2week),
+         notified_2_5week = COALESCE($4, pr_staleness_state.notified_2_5week),
+         notified_1month = COALESCE($5, pr_staleness_state.notified_1month),
+         resolved_discord_id = COALESCE($6, pr_staleness_state.resolved_discord_id),
+         updated_at = now()`,
+      [repoStr, num, notified_2week ?? null, notified_2_5week ?? null, notified_1month ?? null, resolvedDiscordId ? String(resolvedDiscordId) : null]
+    );
+  } catch (e: any) {
+    logger.error('Failed to save pr_staleness_state row', { error: e.message, repo: repoStr, prNumber: num });
+    return res.status(500).json({ error: 'Failed to save PR staleness state' });
+  }
+
+  res.status(200).json({ success: true });
+});
+
+const PR_STALENESS_GET_SIGNING_PREFIX = 'GET /api/webhooks/norozo/pr-staleness?repo=';
+
+// GET /api/webhooks/norozo/pr-staleness?repo=...&pr_number=...
+router.get('/webhooks/norozo/pr-staleness', async (req: Request, res: Response) => {
+  const repo = String(req.query.repo || '').trim();
+  const prNumber = String(req.query.pr_number || '').trim();
+  if (!repo || !prNumber) return res.status(400).json({ error: 'repo and pr_number query params are required' });
+
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const expected = signBody(`${PR_STALENESS_GET_SIGNING_PREFIX}${repo}&pr_number=${prNumber}`);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(sigHeader);
+  if (!sigHeader || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    logger.warn('Norozo pr-staleness read unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo pr-staleness read',
+      message: `GET /api/webhooks/norozo/pr-staleness rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  try {
+    await ensurePrStalenessSchema();
+    const { result } = await dbService.query(
+      'SELECT notified_2week, notified_2_5week, notified_1month, resolved_discord_id, updated_at FROM pr_staleness_state WHERE repo = $1 AND pr_number = $2',
+      [repo, Number(prNumber)]
+    );
+    if (!result.rows[0]) {
+      return res.json({ repo, prNumber: Number(prNumber), notified2Week: false, notified2_5Week: false, notified1Month: false, resolvedDiscordId: null });
+    }
+    const row = result.rows[0] as any;
+    res.json({
+      repo,
+      prNumber: Number(prNumber),
+      notified2Week: row.notified_2week,
+      notified2_5Week: row.notified_2_5week,
+      notified1Month: row.notified_1month,
+      resolvedDiscordId: row.resolved_discord_id,
+      updatedAt: row.updated_at,
+    });
+  } catch (e: any) {
+    logger.error('Failed to read pr_staleness_state row', { error: e.message, repo, prNumber });
+    res.status(500).json({ error: 'Failed to read PR staleness state' });
+  }
+});
+
 export default router;
