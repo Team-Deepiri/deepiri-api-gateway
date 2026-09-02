@@ -590,9 +590,10 @@ router.get('/webhooks/norozo/member-email/by-email', async (req: Request, res: R
 });
 
 // --- PR staleness tracking ----------------------------------------------------
-// Tracks which staleness tiers (2 week / 2.5 week / 1 month) have already
-// fired for a given PR, so a periodic scan never re-notifies the same tier on
-// every run. Same signed-webhook scheme as everything else above.
+// Tracks the one-time 2-week/1-month tiers plus the recurring author/reviewer
+// DM cooldowns for a given PR, so a periodic scan knows what's already fired
+// and when it's next allowed to nag again. Same signed-webhook scheme as
+// everything else above.
 
 let prStalenessSchemaReadyPromise: Promise<void> | null = null;
 
@@ -604,14 +605,17 @@ function ensurePrStalenessSchema(): Promise<void> {
           repo TEXT NOT NULL,
           pr_number INTEGER NOT NULL,
           notified_2week BOOLEAN NOT NULL DEFAULT false,
-          notified_2_5week BOOLEAN NOT NULL DEFAULT false,
           notified_1month BOOLEAN NOT NULL DEFAULT false,
           resolved_discord_id TEXT,
+          last_author_dm_at TIMESTAMPTZ,
+          reviewer_dm_state JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (repo, pr_number)
         )
       `);
+      await dbService.query(`ALTER TABLE pr_staleness_state ADD COLUMN IF NOT EXISTS last_author_dm_at TIMESTAMPTZ`);
+      await dbService.query(`ALTER TABLE pr_staleness_state ADD COLUMN IF NOT EXISTS reviewer_dm_state JSONB NOT NULL DEFAULT '{}'::jsonb`);
       logger.info('pr_staleness_state table ready');
     })().catch((e: any) => {
       prStalenessSchemaReadyPromise = null;
@@ -621,8 +625,8 @@ function ensurePrStalenessSchema(): Promise<void> {
   return prStalenessSchemaReadyPromise;
 }
 
-// POST /api/webhooks/norozo/pr-staleness — upsert the notified-tier flags (and
-// optionally a resolved_discord_id cache) for one repo+PR.
+// POST /api/webhooks/norozo/pr-staleness — upsert the notified-tier flags, DM
+// cooldown timestamps, and optionally a resolved_discord_id cache for one repo+PR.
 router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response) => {
   const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
   const rawBody: Buffer | undefined = (req as any).rawBody;
@@ -637,7 +641,15 @@ router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response)
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
 
-  const { repo, pr_number: prNumber, notified_2week, notified_2_5week, notified_1month, resolved_discord_id: resolvedDiscordId } = req.body || {};
+  const {
+    repo,
+    pr_number: prNumber,
+    notified_2week,
+    notified_1month,
+    resolved_discord_id: resolvedDiscordId,
+    last_author_dm_at: lastAuthorDmAt,
+    reviewer_dm_state: reviewerDmState,
+  } = req.body || {};
   const repoStr = String(repo || '').trim();
   const num = Number(prNumber);
   if (!repoStr || !Number.isInteger(num)) {
@@ -645,18 +657,32 @@ router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response)
   }
   if (repoStr.length > 200) return res.status(400).json({ error: 'repo too long' });
 
+  let reviewerDmStateJson: string | null = null;
+  if (reviewerDmState && typeof reviewerDmState === 'object') {
+    reviewerDmStateJson = JSON.stringify(reviewerDmState);
+  }
+
   try {
     await ensurePrStalenessSchema();
     await dbService.query(
-      `INSERT INTO pr_staleness_state (repo, pr_number, notified_2week, notified_2_5week, notified_1month, resolved_discord_id, updated_at)
-       VALUES ($1, $2, COALESCE($3, false), COALESCE($4, false), COALESCE($5, false), $6, now())
+      `INSERT INTO pr_staleness_state (repo, pr_number, notified_2week, notified_1month, resolved_discord_id, last_author_dm_at, reviewer_dm_state, updated_at)
+       VALUES ($1, $2, COALESCE($3, false), COALESCE($4, false), $5, $6, COALESCE($7::jsonb, '{}'::jsonb), now())
        ON CONFLICT (repo, pr_number) DO UPDATE SET
          notified_2week = COALESCE($3, pr_staleness_state.notified_2week),
-         notified_2_5week = COALESCE($4, pr_staleness_state.notified_2_5week),
-         notified_1month = COALESCE($5, pr_staleness_state.notified_1month),
-         resolved_discord_id = COALESCE($6, pr_staleness_state.resolved_discord_id),
+         notified_1month = COALESCE($4, pr_staleness_state.notified_1month),
+         resolved_discord_id = COALESCE($5, pr_staleness_state.resolved_discord_id),
+         last_author_dm_at = COALESCE($6, pr_staleness_state.last_author_dm_at),
+         reviewer_dm_state = COALESCE($7::jsonb, pr_staleness_state.reviewer_dm_state),
          updated_at = now()`,
-      [repoStr, num, notified_2week ?? null, notified_2_5week ?? null, notified_1month ?? null, resolvedDiscordId ? String(resolvedDiscordId) : null]
+      [
+        repoStr,
+        num,
+        notified_2week ?? null,
+        notified_1month ?? null,
+        resolvedDiscordId ? String(resolvedDiscordId) : null,
+        lastAuthorDmAt ? String(lastAuthorDmAt) : null,
+        reviewerDmStateJson,
+      ]
     );
   } catch (e: any) {
     logger.error('Failed to save pr_staleness_state row', { error: e.message, repo: repoStr, prNumber: num });
@@ -692,20 +718,29 @@ router.get('/webhooks/norozo/pr-staleness', async (req: Request, res: Response) 
   try {
     await ensurePrStalenessSchema();
     const { result } = await dbService.query(
-      'SELECT notified_2week, notified_2_5week, notified_1month, resolved_discord_id, updated_at FROM pr_staleness_state WHERE repo = $1 AND pr_number = $2',
+      'SELECT notified_2week, notified_1month, resolved_discord_id, last_author_dm_at, reviewer_dm_state, updated_at FROM pr_staleness_state WHERE repo = $1 AND pr_number = $2',
       [repo, Number(prNumber)]
     );
     if (!result.rows[0]) {
-      return res.json({ repo, prNumber: Number(prNumber), notified2Week: false, notified2_5Week: false, notified1Month: false, resolvedDiscordId: null });
+      return res.json({
+        repo,
+        prNumber: Number(prNumber),
+        notified2Week: false,
+        notified1Month: false,
+        resolvedDiscordId: null,
+        lastAuthorDmAt: null,
+        reviewerDmState: {},
+      });
     }
     const row = result.rows[0] as any;
     res.json({
       repo,
       prNumber: Number(prNumber),
       notified2Week: row.notified_2week,
-      notified2_5Week: row.notified_2_5week,
       notified1Month: row.notified_1month,
       resolvedDiscordId: row.resolved_discord_id,
+      lastAuthorDmAt: row.last_author_dm_at,
+      reviewerDmState: row.reviewer_dm_state || {},
       updatedAt: row.updated_at,
     });
   } catch (e: any) {
