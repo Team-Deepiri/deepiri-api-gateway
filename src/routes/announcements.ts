@@ -692,6 +692,57 @@ router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response)
   res.status(200).json({ success: true });
 });
 
+// POST /api/webhooks/norozo/pr-staleness/claim-1month — atomically transitions
+// notified_1month from false to true for one repo+PR, returning claimed:true
+// only to the single caller that performed the transition. Norozo only posts
+// the public #announcements alert when this returns true, so two overlapping
+// scan loops (e.g. old + new process both alive during a Render redeploy) can
+// never both post the same PR's one-time announcement — a plain
+// read-then-write (GET the flag, then POST notified_1month=true) is racy since
+// both can read false before either writes true; this makes the check-and-set
+// a single atomic UPDATE instead.
+router.post('/webhooks/norozo/pr-staleness/claim-1month', async (req: Request, res: Response) => {
+  const sigHeader = String(req.headers['x-norozo-signature'] || '').trim();
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+  if (!rawBody || !verifySignature(rawBody, sigHeader)) {
+    logger.warn('Norozo pr-staleness claim webhook unauthorized', { hasSignature: !!sigHeader });
+    alertNorozo({
+      title: 'Rejected inbound Norozo pr-staleness claim',
+      message: `POST /api/webhooks/norozo/pr-staleness/claim-1month rejected (${sigHeader ? 'invalid' : 'missing'} signature) from ${req.ip}`,
+      severity: 'warning',
+      steps: WEBHOOK_REJECTION_STEPS,
+    });
+    return res.status(401).json({ error: 'Missing or invalid signature' });
+  }
+
+  const { repo, pr_number: prNumber } = req.body || {};
+  const repoStr = String(repo || '').trim();
+  const num = Number(prNumber);
+  if (!repoStr || !Number.isInteger(num)) {
+    return res.status(400).json({ error: 'repo and integer pr_number are required' });
+  }
+
+  try {
+    await ensurePrStalenessSchema();
+    // Ensure the row exists first (won't touch notified_1month if it already does).
+    await dbService.query(
+      `INSERT INTO pr_staleness_state (repo, pr_number) VALUES ($1, $2)
+       ON CONFLICT (repo, pr_number) DO NOTHING`,
+      [repoStr, num]
+    );
+    const { result } = await dbService.query(
+      `UPDATE pr_staleness_state SET notified_1month = true, updated_at = now()
+       WHERE repo = $1 AND pr_number = $2 AND notified_1month = false
+       RETURNING 1`,
+      [repoStr, num]
+    );
+    res.status(200).json({ claimed: result.rowCount === 1 });
+  } catch (e: any) {
+    logger.error('Failed to claim pr_staleness 1-month announcement', { error: e.message, repo: repoStr, prNumber: num });
+    res.status(500).json({ error: 'Failed to claim PR staleness 1-month slot' });
+  }
+});
+
 const PR_STALENESS_GET_SIGNING_PREFIX = 'GET /api/webhooks/norozo/pr-staleness?repo=';
 
 // GET /api/webhooks/norozo/pr-staleness?repo=...&pr_number=...
