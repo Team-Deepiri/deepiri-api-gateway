@@ -106,6 +106,7 @@ interface AnnouncementRow {
   created_at: string;
   source: 'web' | 'norozo';
   discord_channel_id: string | null;
+  color: string | null;
 }
 
 interface Announcement {
@@ -117,6 +118,7 @@ interface Announcement {
   createdAt: string;
   source: 'web' | 'norozo';
   discordChannelId?: string;
+  color?: string;
 }
 
 function toAnnouncement(row: AnnouncementRow): Announcement {
@@ -129,7 +131,16 @@ function toAnnouncement(row: AnnouncementRow): Announcement {
     createdAt: new Date(row.created_at).toISOString(),
     source: row.source,
     discordChannelId: row.discord_channel_id ?? undefined,
+    color: row.color ?? undefined,
   };
+}
+
+// Discord embed colors come through as "#rrggbb" from Norozo -- validate before
+// it ever reaches a SQL param or gets echoed into the page as an inline style.
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+function sanitizeColor(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return HEX_COLOR_RE.test(value) ? value : null;
 }
 
 // Postgres, not in-memory + a JSON file — the previous store lost every announcement's
@@ -152,8 +163,12 @@ function ensureSchema(): Promise<void> {
           author_id TEXT,
           source TEXT NOT NULL,
           discord_channel_id TEXT,
+          color TEXT,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
+      `);
+      await dbService.query(`
+        ALTER TABLE announcements ADD COLUMN IF NOT EXISTS color TEXT
       `);
       await dbService.query(`
         CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC)
@@ -273,7 +288,7 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
 
-  const { title, body, content, author, author_id: authorId, discord_channel_id: discordChannelId } = req.body || {};
+  const { title, body, content, author, author_id: authorId, discord_channel_id: discordChannelId, color } = req.body || {};
   const finalTitle = String(title || content?.slice(0, 80) || 'Discord Announcement').trim().slice(0, 200);
   const finalBody = String(body || content || '').trim();
   if (!finalBody) return res.status(400).json({ error: 'Body/content is required' });
@@ -288,14 +303,15 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
     createdAt: new Date().toISOString(),
     source: 'norozo',
     discordChannelId: String(discordChannelId || process.env.ANNOUNCEMENTS_CHANNEL_ID || '1436509524818395156'),
+    color: sanitizeColor(color) ?? undefined,
   };
 
   try {
     await ensureSchema();
     await dbService.query(
-      `INSERT INTO announcements (id, title, body, author_name, author_id, source, discord_channel_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [ann.id, ann.title, ann.body, ann.authorName ?? null, ann.authorId ?? null, ann.source, ann.discordChannelId ?? null]
+      `INSERT INTO announcements (id, title, body, author_name, author_id, source, discord_channel_id, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [ann.id, ann.title, ann.body, ann.authorName ?? null, ann.authorId ?? null, ann.source, ann.discordChannelId ?? null, ann.color ?? null]
     );
   } catch (e: any) {
     logger.error('Failed to store Norozo announcement', { error: e.message });
