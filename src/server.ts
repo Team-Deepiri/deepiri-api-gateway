@@ -19,6 +19,7 @@ import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter from './routes/announcements';
 import aiRouter from './routes/ai';
+import { startHealthMonitor } from './healthMonitor';
 import {
   validateBody,
   validateHeaders,
@@ -795,7 +796,9 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // So '/api/auth/register' becomes '/register' when it reaches the proxy
 // PathRewrite must work with the stripped path
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
-app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
+// '/api/users/*' -> Express strips to '/*' -> rewrite to '/users/*' so it hits the
+// auth-service portal routes (GET /users, GET|PUT /users/profile, PUT /users/:id/role).
+app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth, { '^/': '/users/' })));
 
 // PrismPipe is no longer a network service. It is being repurposed as a library
 // imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
@@ -862,7 +865,30 @@ const authProxyOptions = {
 };
 
 // Announcements + Norozo webhook — must be before the /api/* proxies so body is parsed here
-app.use('/api', express.json(), announcementsRouter);
+// verify: captures the exact raw bytes onto req.rawBody so the Norozo webhook route can
+// HMAC-verify against precisely what Norozo signed (re-serializing the parsed JSON would
+// not byte-match Python's json.dumps output and the signature would never verify).
+app.use(
+  '/api',
+  (req, res, next) => {
+    // Third-party webhook proxies do their own raw-body HMAC verification downstream,
+    // so leave those request streams untouched.
+    if (
+      req.path === '/api/integrations/webhooks' ||
+      req.path.startsWith('/api/integrations/webhooks/')
+    ) {
+      return next();
+    }
+
+    return express.json({
+      verify: (r: any, _res, buf) => {
+        r.rawBody = buf;
+      },
+    })(req, res, next);
+  },
+  announcementsRouter
+);
+
 app.use('/api/ai', express.json(), aiRouter);
 
 // Wire header validation before body validation so unknown x-* headers
@@ -884,6 +910,12 @@ app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': 
 // trusted x-user-id rather than letting messaging-service's authenticate()
 // trust whatever header a client sends directly.
 app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
+// The /github/* read API exposes team pull-request activity and must only be
+// reachable by a signed-in portal user -- verify the JWT here. Inbound webhooks
+// and OAuth callbacks under /api/integrations stay open by design (GitHub signs
+// its own deliveries), so this guard is scoped to the /github subtree only and
+// the generic proxy below still forwards the full path.
+app.use('/api/integrations/github', userAuthMiddleware);
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
@@ -1288,6 +1320,7 @@ httpServer.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
   logger.info('Proxying to services:', SERVICES);
   logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
+  startHealthMonitor();
 }).on('error', (error: any) => {
   logger.error('Server error:', error);
   if (error.code === 'EADDRINUSE') {
