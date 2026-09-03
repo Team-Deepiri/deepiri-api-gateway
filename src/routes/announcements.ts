@@ -447,11 +447,20 @@ function ensureMemberEmailSchema(): Promise<void> {
         CREATE TABLE IF NOT EXISTS member_emails (
           discord_id TEXT PRIMARY KEY,
           discord_username TEXT,
-          email TEXT NOT NULL,
+          email TEXT,
+          real_name TEXT,
+          github_username TEXT,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
       `);
+      // email used to be NOT NULL -- now a row can exist with just a
+      // self-reported GitHub link (real_name/github_username) before any
+      // email is known, since this is a dynamically-built identity cache
+      // now, not just an email store.
+      await dbService.query(`ALTER TABLE member_emails ALTER COLUMN email DROP NOT NULL`);
+      await dbService.query(`ALTER TABLE member_emails ADD COLUMN IF NOT EXISTS real_name TEXT`);
+      await dbService.query(`ALTER TABLE member_emails ADD COLUMN IF NOT EXISTS github_username TEXT`);
       logger.info('member_emails table ready');
     })().catch((e: any) => {
       memberEmailSchemaReadyPromise = null;
@@ -478,22 +487,36 @@ router.post('/webhooks/norozo/member-email', async (req: Request, res: Response)
     return res.status(401).json({ error: 'Missing or invalid signature' });
   }
 
-  const { discord_id: discordId, discord_username: discordUsername, email } = req.body || {};
+  const {
+    discord_id: discordId,
+    discord_username: discordUsername,
+    email,
+    real_name: realName,
+    github_username: githubUsername,
+  } = req.body || {};
   const id = String(discordId || '').trim();
-  const mail = String(email || '').trim();
-  if (!id || !mail) {
-    return res.status(400).json({ error: 'discord_id and email are required' });
+  const mail = email ? String(email).trim() : null;
+  const name = realName ? String(realName).trim() : null;
+  const ghUsername = githubUsername ? String(githubUsername).trim() : null;
+  if (!id || (!mail && !name && !ghUsername)) {
+    return res.status(400).json({ error: 'discord_id and at least one of email/real_name/github_username are required' });
   }
-  if (id.length > 32 || mail.length > 320) {
-    return res.status(400).json({ error: 'discord_id/email too long' });
+  if (id.length > 32 || (mail && mail.length > 320) || (name && name.length > 200) || (ghUsername && ghUsername.length > 200)) {
+    return res.status(400).json({ error: 'field too long' });
   }
 
   try {
     await ensureMemberEmailSchema();
     await dbService.query(
-      `INSERT INTO member_emails (discord_id, discord_username, email, updated_at) VALUES ($1, $2, $3, now())
-       ON CONFLICT (discord_id) DO UPDATE SET email = EXCLUDED.email, discord_username = EXCLUDED.discord_username, updated_at = now()`,
-      [id, discordUsername ? String(discordUsername).slice(0, 200) : null, mail]
+      `INSERT INTO member_emails (discord_id, discord_username, email, real_name, github_username, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (discord_id) DO UPDATE SET
+         email = COALESCE(EXCLUDED.email, member_emails.email),
+         real_name = COALESCE(EXCLUDED.real_name, member_emails.real_name),
+         github_username = COALESCE(EXCLUDED.github_username, member_emails.github_username),
+         discord_username = COALESCE(EXCLUDED.discord_username, member_emails.discord_username),
+         updated_at = now()`,
+      [id, discordUsername ? String(discordUsername).slice(0, 200) : null, mail, name, ghUsername]
     );
   } catch (e: any) {
     logger.error('Failed to save member_emails row', { error: e.message, discordId: id });
@@ -527,8 +550,14 @@ router.get('/webhooks/norozo/member-email', async (req: Request, res: Response) 
 
   try {
     await ensureMemberEmailSchema();
-    const { result } = await dbService.query<{ email: string; discord_username: string | null; updated_at: string }>(
-      'SELECT email, discord_username, updated_at FROM member_emails WHERE discord_id = $1',
+    const { result } = await dbService.query<{
+      email: string | null;
+      discord_username: string | null;
+      real_name: string | null;
+      github_username: string | null;
+      updated_at: string;
+    }>(
+      'SELECT email, discord_username, real_name, github_username, updated_at FROM member_emails WHERE discord_id = $1',
       [discordId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
@@ -536,6 +565,8 @@ router.get('/webhooks/norozo/member-email', async (req: Request, res: Response) 
       discordId,
       email: result.rows[0].email,
       discordUsername: result.rows[0].discord_username,
+      realName: result.rows[0].real_name,
+      githubUsername: result.rows[0].github_username,
       updatedAt: result.rows[0].updated_at,
     });
   } catch (e: any) {
