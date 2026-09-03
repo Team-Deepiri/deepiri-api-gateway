@@ -146,60 +146,31 @@ function sanitizeColor(value: unknown): string | null {
 // Postgres, not in-memory + a JSON file — the previous store lost every announcement's
 // history on each container recreate (which happens on every deploy), and gave no way
 // to bound how much history accumulated. api-gateway already has a pooled Postgres
-// connection (dbService) for this exact purpose; no new infra needed. Table is created
-// lazily on first use rather than via a migration tool, matching this service's existing
-// pattern (no migration framework is wired up here).
-let schemaReadyPromise: Promise<void> | null = null;
+// connection (dbService) for this exact purpose; no new infra needed. Schema is created
+// by a tracked migration at startup (migrationRunner.ts) rather than lazily per-request.
+let seedCheckedOnce = false;
 
-function ensureSchema(): Promise<void> {
-  if (!schemaReadyPromise) {
-    schemaReadyPromise = (async () => {
-      await dbService.query(`
-        CREATE TABLE IF NOT EXISTS announcements (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          body TEXT NOT NULL,
-          author_name TEXT,
-          author_id TEXT,
-          source TEXT NOT NULL,
-          discord_channel_id TEXT,
-          color TEXT,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-      `);
-      await dbService.query(`
-        ALTER TABLE announcements ADD COLUMN IF NOT EXISTS color TEXT
-      `);
-      await dbService.query(`
-        CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC)
-      `);
-      const seedCheck = await dbService.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM announcements');
-      if (seedCheck.result.rows[0]?.count === '0') {
-        await dbService.query(
-          `INSERT INTO announcements (id, title, body, author_name, source) VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (id) DO NOTHING`,
-          [
-            'seed-1',
-            'Welcome to the new Deepiri Platform',
-            'This is the new internal hub. Check Team Meetings on your Dashboard (role-filtered), and explore Tools for Registry, Jobs, Documents, and more. Norozo will now auto-forward every post from Discord #announcements here.',
-            'Deepiri Team',
-            'web',
-          ]
-        );
-      }
-      logger.info('Announcements table ready');
-    })().catch((e: any) => {
-      // Let the next request retry schema setup instead of caching a permanent failure.
-      schemaReadyPromise = null;
-      throw e;
-    });
+export async function seedAnnouncementsIfEmpty(): Promise<void> {
+  if (seedCheckedOnce) return;
+  seedCheckedOnce = true;
+  const seedCheck = await dbService.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM announcements');
+  if (seedCheck.result.rows[0]?.count === '0') {
+    await dbService.query(
+      `INSERT INTO announcements (id, title, body, author_name, source) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        'seed-1',
+        'Welcome to the new Deepiri Platform',
+        'This is the new internal hub. Check Team Meetings on your Dashboard (role-filtered), and explore Tools for Registry, Jobs, Documents, and more. Norozo will now auto-forward every post from Discord #announcements here.',
+        'Deepiri Team',
+        'web',
+      ]
+    );
   }
-  return schemaReadyPromise;
 }
 
 async function pruneOldAnnouncements(): Promise<void> {
   try {
-    await ensureSchema();
     const { result } = await dbService.query(
       `DELETE FROM announcements WHERE created_at < now() - ($1 || ' days')::interval`,
       [ANNOUNCEMENTS_RETENTION_DAYS]
@@ -219,7 +190,6 @@ setInterval(() => void pruneOldAnnouncements(), PRUNE_INTERVAL_MS);
 // GET /api/announcements — list
 router.get('/announcements', async (req: Request, res: Response) => {
   try {
-    await ensureSchema();
     const { result } = await dbService.query<AnnouncementRow>(
       'SELECT * FROM announcements ORDER BY created_at DESC LIMIT 200'
     );
@@ -251,7 +221,6 @@ router.post('/announcements', userAuthMiddleware as any, async (req: Request, re
   };
 
   try {
-    await ensureSchema();
     await dbService.query(
       `INSERT INTO announcements (id, title, body, author_name, author_id, source) VALUES ($1, $2, $3, $4, $5, $6)`,
       [ann.id, ann.title, ann.body, ann.authorName ?? null, ann.authorId ?? null, ann.source]
@@ -307,7 +276,6 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
   };
 
   try {
-    await ensureSchema();
     await dbService.query(
       `INSERT INTO announcements (id, title, body, author_name, author_id, source, discord_channel_id, color)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
@@ -329,27 +297,6 @@ router.post('/webhooks/norozo/announcements', async (req: Request, res: Response
 // so reuse that same HMAC scheme + Postgres pool instead of standing up new infra.
 // Tiny generic key/value table — not announcement-specific — in case other bot state
 // needs the same durability later.
-
-let stateSchemaReadyPromise: Promise<void> | null = null;
-
-function ensureStateSchema(): Promise<void> {
-  if (!stateSchemaReadyPromise) {
-    stateSchemaReadyPromise = (async () => {
-      await dbService.query(`
-        CREATE TABLE IF NOT EXISTS bot_state (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-      `);
-      logger.info('bot_state table ready');
-    })().catch((e: any) => {
-      stateSchemaReadyPromise = null;
-      throw e;
-    });
-  }
-  return stateSchemaReadyPromise;
-}
 
 // GET has no body to HMAC over, so sign a fixed string instead — same secret,
 // same timing-safe comparison as the POST routes above.
@@ -383,7 +330,6 @@ router.post('/webhooks/norozo/state', async (req: Request, res: Response) => {
   }
 
   try {
-    await ensureStateSchema();
     await dbService.query(
       `INSERT INTO bot_state (key, value, updated_at) VALUES ($1, $2, now())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
@@ -418,7 +364,6 @@ router.get('/webhooks/norozo/state', async (req: Request, res: Response) => {
   if (!stateKey) return res.status(400).json({ error: 'key query param is required' });
 
   try {
-    await ensureStateSchema();
     const { result } = await dbService.query<{ value: string; updated_at: string }>(
       'SELECT value, updated_at FROM bot_state WHERE key = $1',
       [stateKey]
@@ -437,38 +382,6 @@ router.get('/webhooks/norozo/state', async (req: Request, res: Response) => {
 // since this is real per-member data other things may eventually want to query
 // (e.g. "list everyone missing an email on file"), not an opaque checkpoint blob.
 // Same signed-webhook scheme as the routes above.
-
-let memberEmailSchemaReadyPromise: Promise<void> | null = null;
-
-function ensureMemberEmailSchema(): Promise<void> {
-  if (!memberEmailSchemaReadyPromise) {
-    memberEmailSchemaReadyPromise = (async () => {
-      await dbService.query(`
-        CREATE TABLE IF NOT EXISTS member_emails (
-          discord_id TEXT PRIMARY KEY,
-          discord_username TEXT,
-          email TEXT,
-          real_name TEXT,
-          github_username TEXT,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-      `);
-      // email used to be NOT NULL -- now a row can exist with just a
-      // self-reported GitHub link (real_name/github_username) before any
-      // email is known, since this is a dynamically-built identity cache
-      // now, not just an email store.
-      await dbService.query(`ALTER TABLE member_emails ALTER COLUMN email DROP NOT NULL`);
-      await dbService.query(`ALTER TABLE member_emails ADD COLUMN IF NOT EXISTS real_name TEXT`);
-      await dbService.query(`ALTER TABLE member_emails ADD COLUMN IF NOT EXISTS github_username TEXT`);
-      logger.info('member_emails table ready');
-    })().catch((e: any) => {
-      memberEmailSchemaReadyPromise = null;
-      throw e;
-    });
-  }
-  return memberEmailSchemaReadyPromise;
-}
 
 const MEMBER_EMAIL_GET_SIGNING_PREFIX = 'GET /api/webhooks/norozo/member-email?discord_id=';
 
@@ -506,7 +419,6 @@ router.post('/webhooks/norozo/member-email', async (req: Request, res: Response)
   }
 
   try {
-    await ensureMemberEmailSchema();
     await dbService.query(
       `INSERT INTO member_emails (discord_id, discord_username, email, real_name, github_username, updated_at)
        VALUES ($1, $2, $3, $4, $5, now())
@@ -549,7 +461,6 @@ router.get('/webhooks/norozo/member-email', async (req: Request, res: Response) 
   }
 
   try {
-    await ensureMemberEmailSchema();
     const { result } = await dbService.query<{
       email: string | null;
       discord_username: string | null;
@@ -602,7 +513,6 @@ router.get('/webhooks/norozo/member-email/by-email', async (req: Request, res: R
   }
 
   try {
-    await ensureMemberEmailSchema();
     const { result } = await dbService.query<{ discord_id: string; discord_username: string | null; updated_at: string }>(
       'SELECT discord_id, discord_username, updated_at FROM member_emails WHERE lower(email) = $1',
       [email]
@@ -625,36 +535,6 @@ router.get('/webhooks/norozo/member-email/by-email', async (req: Request, res: R
 // DM cooldowns for a given PR, so a periodic scan knows what's already fired
 // and when it's next allowed to nag again. Same signed-webhook scheme as
 // everything else above.
-
-let prStalenessSchemaReadyPromise: Promise<void> | null = null;
-
-function ensurePrStalenessSchema(): Promise<void> {
-  if (!prStalenessSchemaReadyPromise) {
-    prStalenessSchemaReadyPromise = (async () => {
-      await dbService.query(`
-        CREATE TABLE IF NOT EXISTS pr_staleness_state (
-          repo TEXT NOT NULL,
-          pr_number INTEGER NOT NULL,
-          notified_2week BOOLEAN NOT NULL DEFAULT false,
-          notified_1month BOOLEAN NOT NULL DEFAULT false,
-          resolved_discord_id TEXT,
-          last_author_dm_at TIMESTAMPTZ,
-          reviewer_dm_state JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          PRIMARY KEY (repo, pr_number)
-        )
-      `);
-      await dbService.query(`ALTER TABLE pr_staleness_state ADD COLUMN IF NOT EXISTS last_author_dm_at TIMESTAMPTZ`);
-      await dbService.query(`ALTER TABLE pr_staleness_state ADD COLUMN IF NOT EXISTS reviewer_dm_state JSONB NOT NULL DEFAULT '{}'::jsonb`);
-      logger.info('pr_staleness_state table ready');
-    })().catch((e: any) => {
-      prStalenessSchemaReadyPromise = null;
-      throw e;
-    });
-  }
-  return prStalenessSchemaReadyPromise;
-}
 
 // POST /api/webhooks/norozo/pr-staleness — upsert the notified-tier flags, DM
 // cooldown timestamps, and optionally a resolved_discord_id cache for one repo+PR.
@@ -694,7 +574,6 @@ router.post('/webhooks/norozo/pr-staleness', async (req: Request, res: Response)
   }
 
   try {
-    await ensurePrStalenessSchema();
     await dbService.query(
       `INSERT INTO pr_staleness_state (repo, pr_number, notified_2week, notified_1month, resolved_discord_id, last_author_dm_at, reviewer_dm_state, updated_at)
        VALUES ($1, $2, COALESCE($3, false), COALESCE($4, false), $5, $6, COALESCE($7::jsonb, '{}'::jsonb), now())
@@ -754,7 +633,6 @@ router.post('/webhooks/norozo/pr-staleness/claim-1month', async (req: Request, r
   }
 
   try {
-    await ensurePrStalenessSchema();
     // Ensure the row exists first (won't touch notified_1month if it already does).
     await dbService.query(
       `INSERT INTO pr_staleness_state (repo, pr_number) VALUES ($1, $2)
@@ -798,7 +676,6 @@ router.get('/webhooks/norozo/pr-staleness', async (req: Request, res: Response) 
   }
 
   try {
-    await ensurePrStalenessSchema();
     const { result } = await dbService.query(
       'SELECT notified_2week, notified_1month, resolved_discord_id, last_author_dm_at, reviewer_dm_state, updated_at FROM pr_staleness_state WHERE repo = $1 AND pr_number = $2',
       [repo, Number(prNumber)]
