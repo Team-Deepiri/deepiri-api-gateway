@@ -18,6 +18,7 @@ import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter from './routes/announcements';
+import norozoStateRouter from './routes/norozoState';
 import {
   validateBody,
   validateHeaders,
@@ -871,7 +872,8 @@ app.use(
       req.rawBody = buf;
     },
   }),
-  announcementsRouter
+  announcementsRouter,
+  norozoStateRouter
 );
 
 // Wire header validation before body validation so unknown x-* headers
