@@ -18,6 +18,7 @@ import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter from './routes/announcements';
+import memberEmailRouter from './routes/memberEmail';
 import {
   validateBody,
   validateHeaders,
@@ -871,7 +872,8 @@ app.use(
       req.rawBody = buf;
     },
   }),
-  announcementsRouter
+  announcementsRouter,
+  memberEmailRouter
 );
 
 // Wire header validation before body validation so unknown x-* headers
