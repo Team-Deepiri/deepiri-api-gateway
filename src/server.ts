@@ -17,8 +17,10 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
-import announcementsRouter from './routes/announcements';
+import announcementsRouter, { seedAnnouncementsIfEmpty } from './routes/announcements';
 import norozoStateRouter from './routes/norozoState';
+import { startHealthMonitor } from './healthMonitor';
+import { runMigrations } from './migrationRunner';
 import {
   validateBody,
   validateHeaders,
@@ -230,8 +232,11 @@ async function initializeServices() {
     logger.info('Initializing PostgreSQL connection pool...');
     await dbService.initDb();
     logger.info('PostgreSQL connection pool ready');
+    await runMigrations();
+    logger.info('Database migrations applied');
+    await seedAnnouncementsIfEmpty();
   } catch (error: any) {
-    logger.warn('PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn('PostgreSQL initialization/migration failed (will retry on first use):', error.message);
   }
 }
 
@@ -795,7 +800,9 @@ const createProxy = (target: string, pathRewrite?: { [key: string]: string }): a
 // So '/api/auth/register' becomes '/register' when it reaches the proxy
 // PathRewrite must work with the stripped path
 // For '/api/auth/register' -> Express strips to '/register' -> rewrite to '/auth/register'
-app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth)));
+// '/api/users/*' -> Express strips to '/*' -> rewrite to '/users/*' so it hits the
+// auth-service portal routes (GET /users, GET|PUT /users/profile, PUT /users/:id/role).
+app.use('/api/users', createProxyMiddleware(createProxy(SERVICES.auth, { '^/': '/users/' })));
 
 // PrismPipe is no longer a network service. It is being repurposed as a library
 // imported by Cyrex to drive the AGI plane (pipeline_stage_inputs / artifacts),
@@ -867,11 +874,18 @@ const authProxyOptions = {
 // not byte-match Python's json.dumps output and the signature would never verify).
 app.use(
   '/api',
-  express.json({
-    verify: (req: any, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
+(req, res, next) => {
+    // Third-party webhook proxies (e.g. external-bridge /webhooks/:provider) do
+    // their own raw-body HMAC verification downstream, so the stream must reach
+    // the proxy untouched — parsing it here would leave the proxied request with
+    // an empty body and break signature checks.
+    if (req.path === '/api/integrations/webhooks' || req.path.startsWith('/api/integrations/webhooks/')) return next();
+    return express.json({
+      verify: (r: any, _res, buf) => {
+        r.rawBody = buf;
+      },
+    })(req, res, next);
+  },
   announcementsRouter,
   norozoStateRouter
 );
@@ -895,6 +909,12 @@ app.use('/api/queues', createProxyMiddleware(createProxy(SERVICES.jobs, { '^/': 
 // trusted x-user-id rather than letting messaging-service's authenticate()
 // trust whatever header a client sends directly.
 app.use('/api/notifications', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging, { '^/': '/api/notifications/' })));
+// The /github/* read API exposes team pull-request activity and must only be
+// reachable by a signed-in portal user -- verify the JWT here. Inbound webhooks
+// and OAuth callbacks under /api/integrations stay open by design (GitHub signs
+// its own deliveries), so this guard is scoped to the /github subtree only and
+// the generic proxy below still forwards the full path.
+app.use('/api/integrations/github', userAuthMiddleware);
 app.use('/api/integrations', createProxyMiddleware(createProxy(SERVICES.integration)));
 app.use('/api/v1/messaging', userAuthMiddleware, createProxyMiddleware(createProxy(SERVICES.messaging)));
 app.use('/api/agent', createProxyMiddleware(createProxy(SERVICES.cyrex, { '^/': '/agent/' })));
@@ -1299,6 +1319,7 @@ httpServer.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
   logger.info('Proxying to services:', SERVICES);
   logger.info('WebSocket support enabled for Socket.IO -> realtime gateway');
+  startHealthMonitor();
 }).on('error', (error: any) => {
   logger.error('Server error:', error);
   if (error.code === 'EADDRINUSE') {
