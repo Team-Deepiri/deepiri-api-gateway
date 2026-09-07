@@ -167,7 +167,6 @@ export async function seedAnnouncementsIfEmpty(): Promise<void> {
       ]
     );
   }
-  return schemaReadyPromise;
 }
 
 async function pruneOldAnnouncements(): Promise<void> {
