@@ -142,7 +142,8 @@ router.post('/webhooks/norozo/member-email', async (req: Request, res: Response)
   const usernameValue = discord_username ? String(discord_username).trim() : null;
   const realNameValue = real_name ? String(real_name).trim() : null;
   const githubValue = github_username ? String(github_username).trim() : null;
-  if (emailValue && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailValue)) {
+  const EMAIL_RE = /^[\w.+-]+@[\w-]+\.[\w.-]+$/;
+  if (emailValue && (emailValue.length > 254 || !EMAIL_RE.test(emailValue))) {
     return res.status(400).json({ error: 'email does not look valid' });
   }
 
