@@ -17,6 +17,7 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
+import aiRouter from './routes/ai';
 import announcementsRouter, { seedAnnouncementsIfEmpty } from './routes/announcements';
 import memberEmailRouter from './routes/memberEmail';
 import norozoStateRouter from './routes/norozoState';
@@ -876,11 +877,15 @@ const authProxyOptions = {
 app.use(
   '/api',
   (req, res, next) => {
-    // Third-party webhook proxies (e.g. external-bridge /webhooks/:provider) do
-    // their own raw-body HMAC verification downstream, so the stream must reach
-    // the proxy untouched — parsing it here would leave the proxied request with
-    // an empty body and break signature checks.
-    if (req.path === '/api/integrations/webhooks' || req.path.startsWith('/api/integrations/webhooks/')) return next();
+    // Third-party webhook proxies do their own raw-body HMAC verification downstream,
+    // so leave those request streams untouched.
+    if (
+      req.path === '/api/integrations/webhooks' ||
+      req.path.startsWith('/api/integrations/webhooks/')
+    ) {
+      return next();
+    }
+
     return express.json({
       verify: (r: any, _res, buf) => {
         r.rawBody = buf;
@@ -891,6 +896,8 @@ app.use(
   memberEmailRouter,
   norozoStateRouter
 );
+
+app.use('/api/ai', express.json(), aiRouter);
 
 // Wire header validation before body validation so unknown x-* headers
 // (e.g. x-internal-secret) are rejected before the body is ever parsed.
