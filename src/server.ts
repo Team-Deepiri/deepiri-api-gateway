@@ -18,6 +18,7 @@ import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
 import announcementsRouter, { seedAnnouncementsIfEmpty } from './routes/announcements';
+import memberEmailRouter from './routes/memberEmail';
 import norozoStateRouter from './routes/norozoState';
 import { startHealthMonitor } from './healthMonitor';
 import { runMigrations } from './migrationRunner';
@@ -874,7 +875,7 @@ const authProxyOptions = {
 // not byte-match Python's json.dumps output and the signature would never verify).
 app.use(
   '/api',
-(req, res, next) => {
+  (req, res, next) => {
     // Third-party webhook proxies (e.g. external-bridge /webhooks/:provider) do
     // their own raw-body HMAC verification downstream, so the stream must reach
     // the proxy untouched — parsing it here would leave the proxied request with
@@ -887,6 +888,7 @@ app.use(
     })(req, res, next);
   },
   announcementsRouter,
+  memberEmailRouter,
   norozoStateRouter
 );
 
