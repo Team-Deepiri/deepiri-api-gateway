@@ -17,9 +17,12 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
-import announcementsRouter from './routes/announcements';
 import aiRouter from './routes/ai';
+import announcementsRouter, { seedAnnouncementsIfEmpty } from './routes/announcements';
+import memberEmailRouter from './routes/memberEmail';
+import norozoStateRouter from './routes/norozoState';
 import { startHealthMonitor } from './healthMonitor';
+import { runMigrations } from './migrationRunner';
 import {
   validateBody,
   validateHeaders,
@@ -231,8 +234,11 @@ async function initializeServices() {
     logger.info('Initializing PostgreSQL connection pool...');
     await dbService.initDb();
     logger.info('PostgreSQL connection pool ready');
+    await runMigrations();
+    logger.info('Database migrations applied');
+    await seedAnnouncementsIfEmpty();
   } catch (error: any) {
-    logger.warn('PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn('PostgreSQL initialization/migration failed (will retry on first use):', error.message);
   }
 }
 
@@ -886,7 +892,9 @@ app.use(
       },
     })(req, res, next);
   },
-  announcementsRouter
+  announcementsRouter,
+  memberEmailRouter,
+  norozoStateRouter
 );
 
 app.use('/api/ai', express.json(), aiRouter);
