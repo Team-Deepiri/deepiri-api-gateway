@@ -17,8 +17,10 @@ import { Timer, calculateStats, formatDuration } from './utils/timing';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
 import { ingestionAuthMiddleware } from './middleware/ingestionAuth.middleware';
 import { userAuthMiddleware } from './middleware/userAuth.middleware';
-import announcementsRouter from './routes/announcements';
+import announcementsRouter, { seedAnnouncementsIfEmpty } from './routes/announcements';
+import norozoStateRouter from './routes/norozoState';
 import { startHealthMonitor } from './healthMonitor';
+import { runMigrations } from './migrationRunner';
 import {
   validateBody,
   validateHeaders,
@@ -230,8 +232,11 @@ async function initializeServices() {
     logger.info('Initializing PostgreSQL connection pool...');
     await dbService.initDb();
     logger.info('PostgreSQL connection pool ready');
+    await runMigrations();
+    logger.info('Database migrations applied');
+    await seedAnnouncementsIfEmpty();
   } catch (error: any) {
-    logger.warn('PostgreSQL initialization failed (will retry on first use):', error.message);
+    logger.warn('PostgreSQL initialization/migration failed (will retry on first use):', error.message);
   }
 }
 
@@ -869,7 +874,7 @@ const authProxyOptions = {
 // not byte-match Python's json.dumps output and the signature would never verify).
 app.use(
   '/api',
-  (req, res, next) => {
+(req, res, next) => {
     // Third-party webhook proxies (e.g. external-bridge /webhooks/:provider) do
     // their own raw-body HMAC verification downstream, so the stream must reach
     // the proxy untouched — parsing it here would leave the proxied request with
@@ -881,7 +886,8 @@ app.use(
       },
     })(req, res, next);
   },
-  announcementsRouter
+  announcementsRouter,
+  norozoStateRouter
 );
 
 // Wire header validation before body validation so unknown x-* headers
